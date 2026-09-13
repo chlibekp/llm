@@ -95,3 +95,38 @@ def test_model_can_overfit_a_single_batch():
         loss.backward()
         opt.step()
     assert loss.item() < first * 0.2
+
+
+def test_loss_only_matches_the_dense_loss():
+    import torch
+
+    from minigpt.config import GPTConfig
+    from minigpt.model import GPT
+
+    torch.manual_seed(0)
+    cfg = GPTConfig(vocab_size=64, block_size=16, n_layer=2, n_head=2, n_embd=32, dropout=0.0)
+    model = GPT(cfg).eval()
+    x = torch.randint(0, cfg.vocab_size, (3, 10))
+    y = torch.randint(0, cfg.vocab_size, (3, 10))
+    y[:, :4] = -100                      # prompt positions
+    y[2, :] = -100                       # a fully masked row
+    with torch.no_grad():
+        _, dense, _ = model(x, targets=y)
+        logits, sparse, _ = model(x, targets=y, loss_only=True)
+    assert logits is None
+    assert torch.allclose(dense, sparse, atol=1e-5)
+
+
+def test_loss_only_with_no_supervised_positions_still_backprops():
+    import torch
+
+    from minigpt.config import GPTConfig
+    from minigpt.model import GPT
+
+    cfg = GPTConfig(vocab_size=64, block_size=16, n_layer=1, n_head=2, n_embd=32, dropout=0.0)
+    model = GPT(cfg)
+    x = torch.randint(0, cfg.vocab_size, (2, 8))
+    y = torch.full((2, 8), -100)
+    _, loss, _ = model(x, targets=y, loss_only=True)
+    loss.backward()
+    assert float(loss.detach()) == 0.0

@@ -95,3 +95,57 @@ def test_train_val_split_is_deterministic_and_disjoint():
     assert (tr1, va1) == (tr2, va2)
     assert len(va1) == 10 and len(tr1) == 90
     assert not set(tr1) & set(va1)
+
+
+def test_dynamic_collate_pads_to_batch_max_not_block_size():
+    from minigpt.data import dynamic_collate
+
+    collate = dynamic_collate(pad_id=0, multiple_of=8)
+    x, y = collate([([1, 2, 3], [-100, 2, 3]), ([4, 5], [-100, 5])])
+    assert x.shape == y.shape == (2, 7)     # max len 3 -> rounded to 8, minus the shift
+    assert x[0].tolist() == [1, 2, 3, 0, 0, 0, 0]
+    assert y[0].tolist() == [2, 3, -100, -100, -100, -100, -100]
+
+
+def test_dynamic_collate_matches_fixed_padding_on_the_real_tokens():
+    from minigpt.data import dynamic_collate
+
+    tok = BPETokenizer.train(["question answer " * 50], vocab_size=400)
+    ds = ChatDataset([("question", "answer", None)], tok, block_size=64)
+    fixed_x, fixed_y = ds[0]
+    dyn_x, dyn_y = dynamic_collate(tok.pad_id, multiple_of=8)([ds.examples[0]])
+    n = dyn_x.shape[1]
+    assert dyn_x[0].tolist() == fixed_x[:n].tolist()
+    assert dyn_y[0].tolist() == fixed_y[:n].tolist()
+
+
+def test_length_grouped_sampler_covers_every_index_once():
+    from minigpt.data import LengthGroupedSampler
+
+    lengths = [(i * 7) % 50 + 1 for i in range(103)]
+    s = LengthGroupedSampler(lengths, batch_size=8, shuffle=True, seed=3)
+    batches = list(s)
+    assert len(batches) == len(s)
+    flat = [i for b in batches for i in b]
+    assert sorted(flat) == list(range(103))
+
+
+def test_length_grouped_sampler_reshuffles_per_epoch():
+    from minigpt.data import LengthGroupedSampler
+
+    lengths = [(i * 7) % 50 + 1 for i in range(103)]
+    s = LengthGroupedSampler(lengths, batch_size=8, shuffle=True, seed=3)
+    s.set_epoch(0)
+    first = list(s)
+    s.set_epoch(1)
+    assert list(s) != first
+
+
+def test_length_grouped_sampler_batches_are_length_homogeneous():
+    from minigpt.data import LengthGroupedSampler
+
+    lengths = [(i * 13) % 200 + 1 for i in range(512)]
+    grouped = LengthGroupedSampler(lengths, batch_size=16, shuffle=True, seed=1)
+    spread = [max(lengths[i] for i in b) - min(lengths[i] for i in b) for b in grouped]
+    # Random batches of 16 drawn from 1..200 would span most of that range.
+    assert sum(spread) / len(spread) < 40

@@ -23,7 +23,14 @@ from torch.utils.data import DataLoader, Dataset
 from .checkpoint import resolve_device, save_checkpoint
 from .chat import iter_texts
 from .config import PRESETS, GPTConfig
-from .data import ChatDataset, PackedTextDataset, load_csv, train_val_split
+from .data import (
+    ChatDataset,
+    LengthGroupedSampler,
+    PackedTextDataset,
+    dynamic_collate,
+    load_csv,
+    train_val_split,
+)
 from .model import GPT
 from .tokenizer import BPETokenizer
 
@@ -47,6 +54,9 @@ class TrainConfig:
     seed: int = 1337
     device: str = "auto"
     compile: bool = False
+    amp: str = "auto"            # "auto" | "bf16" | "fp16" | "off"
+    dynamic_padding: bool = True  # pad each batch to its own longest example
+    pad_multiple: int = 8         # round that length up, to keep matmul shapes few
     num_workers: int = 0
     early_stop_patience: int = 0  # epochs without val improvement; 0 disables
     save: str = "last"            # "last" = final weights, "best" = lowest val loss
@@ -64,19 +74,76 @@ def lr_at(step: int, total: int, cfg: TrainConfig) -> float:
     return min_lr + 0.5 * (cfg.lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def resolve_amp(name: str, device: torch.device) -> torch.dtype | None:
+    """Pick the autocast dtype, or ``None`` to train in full float32.
+
+    bfloat16 has the same exponent range as float32, so unlike float16 it needs
+    no loss scaling - which is why it is the default wherever it is supported.
+    """
+    if name == "off":
+        return None
+    if name == "bf16":
+        return torch.bfloat16
+    if name == "fp16":
+        return torch.float16
+    if device.type == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if device.type == "mps":
+        return torch.bfloat16
+    return None  # CPU autocast is usually slower than plain float32 here
+
+
+def _build_loader(
+    ds: Dataset, cfg: TrainConfig, device: torch.device, shuffle: bool
+) -> tuple[DataLoader, LengthGroupedSampler | None]:
+    """Wrap ``ds`` in a DataLoader, using dynamic padding where it applies."""
+    kwargs = dict(
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=cfg.num_workers > 0,
+    )
+    if cfg.num_workers > 0:
+        kwargs["prefetch_factor"] = 4
+
+    if cfg.dynamic_padding and isinstance(ds, ChatDataset):
+        sampler = LengthGroupedSampler(
+            ds.lengths, cfg.batch_size, shuffle=shuffle, seed=cfg.seed
+        )
+        loader = DataLoader(
+            ds.raw_view(),
+            batch_sampler=sampler,
+            collate_fn=dynamic_collate(ds.pad_id, cfg.pad_multiple),
+            **kwargs,
+        )
+        return loader, sampler
+
+    loader = DataLoader(
+        ds, batch_size=cfg.batch_size, shuffle=shuffle, drop_last=False, **kwargs
+    )
+    return loader, None
+
+
 @torch.no_grad()
-def evaluate(model: GPT, loader: DataLoader, device: torch.device, max_batches: int = 50) -> float:
+def evaluate(
+    model: GPT,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int = 50,
+    amp_dtype: torch.dtype | None = None,
+) -> float:
     model.eval()
-    total, n = 0.0, 0
+    total = torch.zeros((), device=device)
+    n = 0
     for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
-        x, y = x.to(device), y.to(device)
-        _, loss, _ = model(x, targets=y)
-        total += float(loss)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            _, loss, _ = model(x, targets=y, loss_only=True)
+        total += loss.detach().float()
         n += 1
     model.train()
-    return total / max(1, n)
+    return float(total) / max(1, n)
 
 
 def train_model(
@@ -94,12 +161,9 @@ def train_model(
     model.to(device)
     model.train()
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False,
-        num_workers=cfg.num_workers, pin_memory=False,
-    )
+    train_loader, train_sampler = _build_loader(train_ds, cfg, device, shuffle=True)
     val_loader = (
-        DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+        _build_loader(val_ds, cfg, device, shuffle=False)[0]
         if val_ds is not None and len(val_ds) > 0
         else None
     )
@@ -108,12 +172,19 @@ def train_model(
     total_steps = steps_per_epoch * cfg.epochs
     optimizer = model.configure_optimizer(cfg.lr, cfg.weight_decay, cfg.betas)
 
+    amp_dtype = resolve_amp(cfg.amp, device)
+    # float16 silently underflows small gradients, so it needs a loss scaler.
+    # bfloat16 and float32 do not.
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is torch.float16)
+
     if cfg.compile and hasattr(torch, "compile") and device.type == "cuda":
         model = torch.compile(model)  # torch.compile is not reliable on MPS yet
 
+    padding = "dynamic" if train_sampler is not None else "fixed"
     print(
         f"device={device.type} params={model.num_parameters()/1e6:.2f}M "
-        f"examples={len(train_ds)} steps/epoch={steps_per_epoch} total_steps={total_steps}"
+        f"examples={len(train_ds)} steps/epoch={steps_per_epoch} total_steps={total_steps} "
+        f"amp={amp_dtype and str(amp_dtype).removeprefix('torch.') or 'off'} padding={padding}"
     )
 
     history: list[dict] = []
@@ -124,17 +195,29 @@ def train_model(
     t0 = time.time()
     stop = False
 
+    n_micro = len(train_loader)
+    params = [p for p in model.parameters() if p.requires_grad]
+    # Loss is accumulated on-device and only read back when we actually log, so
+    # the training step never blocks waiting for the accelerator to catch up.
+    running = torch.zeros((), device=device)
+    seen = 0
+
     for epoch in range(cfg.epochs):
-        running, seen = 0.0, 0
+        running.zero_()
+        seen = 0
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
         for micro, (x, y) in enumerate(train_loader):
-            x, y = x.to(device), y.to(device)
-            _, loss, _ = model(x, targets=y)
-            (loss / cfg.grad_accum).backward()
-            running += loss.detach().item()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                _, loss, _ = model(x, targets=y, loss_only=True)
+            scaler.scale(loss / cfg.grad_accum).backward()
+            running += loss.detach().float()
             seen += 1
 
-            is_last = micro == len(train_loader) - 1
+            is_last = micro == n_micro - 1
             if (micro + 1) % cfg.grad_accum != 0 and not is_last:
                 continue
 
@@ -142,22 +225,27 @@ def train_model(
             for group in optimizer.param_groups:
                 group["lr"] = lr
             if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+                scaler.unscale_(optimizer)
+                # foreach=None lets torch pick the fused path where it exists (CUDA) and
+                # fall back elsewhere (MPS has no foreach kernels).
+                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip, foreach=None)
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
             if cfg.log_every and step % cfg.log_every == 0:
                 print(
                     f"epoch {epoch+1}/{cfg.epochs} step {step}/{total_steps} "
-                    f"loss {running/max(1,seen):.4f} lr {lr:.2e} "
+                    f"loss {float(running)/max(1,seen):.4f} lr {lr:.2e} "
                     f"{time.time()-t0:.0f}s",
                     flush=True,
                 )
-                running, seen = 0.0, 0
+                running.zero_()
+                seen = 0
 
             if cfg.eval_every and step % cfg.eval_every == 0 and val_loader is not None:
-                val = evaluate(model, val_loader, device)
+                val = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
                 history.append({"step": step, "val_loss": val})
                 print(f"  val loss {val:.4f} (ppl {math.exp(min(20, val)):.2f})", flush=True)
                 if val < best_val:
@@ -167,7 +255,7 @@ def train_model(
                                         {**(meta or {}), "val_loss": val, "step": step})
 
         if val_loader is not None and not cfg.eval_every:
-            val = evaluate(model, val_loader, device)
+            val = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
             history.append({"epoch": epoch + 1, "step": step, "val_loss": val})
             print(
                 f"epoch {epoch+1}/{cfg.epochs} done | val loss {val:.4f} "
@@ -270,6 +358,7 @@ def run_sft(args) -> None:
         val_ratio=args.val_ratio, seed=args.seed, device=args.device,
         num_workers=args.num_workers, early_stop_patience=args.patience,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
+        amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
     )
     meta = {"task": "sft", "dataset": str(args.data), "rows": len(rows), "size": args.size}
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, meta)
@@ -304,5 +393,6 @@ def run_pretrain(args) -> None:
         lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
         seed=args.seed, device=args.device, num_workers=args.num_workers,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
+        amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
     )
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, {"task": "pretrain", "corpus": str(args.text)})

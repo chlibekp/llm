@@ -244,6 +244,13 @@ model this small, and a dataset this small, a separate pretraining stage is opti
 - **Gradient accumulation** — `--grad-accum N` gives you the effect of an `N×` larger
   batch inside the same unified memory.
 - **Gradient clipping** — global norm 1.0.
+- **Dynamic padding** — each batch is padded to its own longest example rather than to
+  `--block-size`, and a length-grouped sampler keeps every batch internally near-uniform
+  in length. Disable with `--no-dynamic-padding`.
+- **Sparse loss head** — during SFT the question and the padding carry the ignore label,
+  so only the answer positions are projected through the output head.
+- **Mixed precision** — `--amp` (default `auto`) runs the forward/backward pass in
+  bfloat16 on MPS and CUDA. Normalization and the loss stay in float32.
 - **Validation** — `--val-ratio` (default 0.1) is held out with a fixed seed, so splits
   are reproducible across runs.
 - **Checkpointing** — `--save last` (default) writes the final weights; `--save best`
@@ -317,6 +324,10 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 | `--lr` | `3e-4` | Peak learning rate |
 | `--weight-decay` / `--warmup-ratio` | `0.1` / `0.05` | Regularization and schedule |
 | `--val-ratio` | `0.1` | Held-out fraction (`0` disables validation) |
+| `--amp` | `auto` | Autocast dtype: `auto`, `bf16`, `fp16`, `off` |
+| `--no-dynamic-padding` | off | Pad every batch to `--block-size` instead |
+| `--num-workers` | `0` | DataLoader worker processes |
+| `--compile` | off | `torch.compile` the model (CUDA only) |
 | `--save` | `last` | `last` or `best` |
 | `--patience` | `0` | Early-stop after N epochs without improvement (0 = off) |
 | `--train-on-prompt` | off | Also compute loss on the question |

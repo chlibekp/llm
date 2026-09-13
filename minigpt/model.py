@@ -202,6 +202,7 @@ class GPT(nn.Module):
         targets: torch.Tensor | None = None,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         pos_offset: int = 0,
+        loss_only: bool = False,
     ):
         """Run the model.
 
@@ -211,6 +212,10 @@ class GPT(nn.Module):
             kv_caches: per-layer ``(k, v)`` tensors for incremental decoding.
             pos_offset: index of the first token of ``idx`` in the full sequence
                 (non-zero when continuing from a cache), used to slice RoPE.
+            loss_only: with ``targets``, return ``logits=None`` and project only
+                the supervised positions through ``lm_head``. During SFT most
+                positions are prompt or padding and carry ``-100``, so this skips
+                the majority of the widest matmul in the model.
 
         Returns:
             ``(logits, loss, new_kv_caches)``.
@@ -232,7 +237,20 @@ class GPT(nn.Module):
                 new_caches.append(nc)
         x = self.norm(x)
 
-        if targets is not None:
+        if targets is not None and loss_only:
+            flat_x = x.reshape(-1, x.size(-1))
+            flat_t = targets.reshape(-1)
+            keep = (flat_t != -100).nonzero(as_tuple=True)[0]
+            logits = None
+            if keep.numel() == 0:
+                # Nothing supervised in this batch; keep the graph connected so
+                # ``backward`` still works and contributes a zero gradient.
+                loss = (flat_x.sum() * 0.0).to(torch.float32)
+            else:
+                loss = F.cross_entropy(
+                    self.lm_head(flat_x.index_select(0, keep)), flat_t.index_select(0, keep)
+                )
+        elif targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100

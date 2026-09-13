@@ -15,12 +15,13 @@ explicitly with ``--input-col`` / ``--output-col``.
 from __future__ import annotations
 
 import csv
+import math
 import random
 import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from .chat import encode_example
 from .tokenizer import BPETokenizer
@@ -143,6 +144,114 @@ class ChatDataset(Dataset):
     @property
     def n_tokens(self) -> int:
         return sum(len(ids) for ids, _ in self.examples)
+
+    @property
+    def lengths(self) -> list[int]:
+        """Real (unpadded) token count of every example."""
+        return [len(ids) for ids, _ in self.examples]
+
+    def raw_view(self) -> "RawChatView":
+        """A view whose items are the unpadded id/label lists.
+
+        Used together with :func:`dynamic_collate`, which pads each batch to its
+        own longest member instead of to ``block_size``. On a typical Q&A set the
+        mean example is a fraction of ``block_size``, so this removes most of the
+        padding - and most of the compute that was spent on it.
+        """
+        return RawChatView(self)
+
+
+class RawChatView(Dataset):
+    """Unpadded ``(ids, labels)`` pairs backing :meth:`ChatDataset.raw_view`."""
+
+    def __init__(self, ds: ChatDataset):
+        self.ds = ds
+        self.pad_id = ds.pad_id
+
+    def __len__(self) -> int:
+        return len(self.ds.examples)
+
+    def __getitem__(self, i: int):
+        return self.ds.examples[i]
+
+
+def dynamic_collate(pad_id: int, multiple_of: int = 8):
+    """Build a ``collate_fn`` that pads a batch to its own longest example.
+
+    The length is rounded up to ``multiple_of`` so the matmul shapes stay in a
+    small, cache-friendly set rather than changing on every batch.
+    """
+
+    def collate(batch: list[tuple[list[int], list[int]]]):
+        n = max(len(ids) for ids, _ in batch)
+        n = multiple_of * math.ceil(n / multiple_of)
+        n = max(n, 2)  # need at least one input and one target after the shift
+        # Pad in Python and build one tensor per side. Assigning row by row into
+        # a pre-allocated tensor costs 2*batch_size tensor constructions instead
+        # of 2, which shows up as real CPU time at these batch sizes.
+        x = torch.tensor(
+            [ids + [pad_id] * (n - len(ids)) for ids, _ in batch], dtype=torch.long
+        )
+        y = torch.tensor(
+            [labels + [-100] * (n - len(labels)) for _, labels in batch], dtype=torch.long
+        )
+        return x[:, :-1], y[:, 1:]
+
+    return collate
+
+
+class LengthGroupedSampler(Sampler[list[int]]):
+    """Batch sampler that puts examples of similar length in the same batch.
+
+    Without it, dynamic padding is only as good as the longest example in each
+    random batch. The classic fix: shuffle, cut the stream into "megabatches" of
+    ``batch_size * pool`` examples, sort each megabatch by length, slice it into
+    batches, then shuffle the batch order. Every epoch still sees a different
+    partition, so this costs no randomness that matters, but each batch is
+    internally near-uniform in length.
+    """
+
+    def __init__(
+        self,
+        lengths: list[int],
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 1337,
+        pool: int = 64,
+        drop_last: bool = False,
+    ):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.pool = max(1, pool)
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        n = len(self.lengths)
+        return n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
+
+    def __iter__(self):
+        idx = list(range(len(self.lengths)))
+        rng = random.Random(self.seed + self.epoch)
+        if self.shuffle:
+            rng.shuffle(idx)
+
+        mega = self.batch_size * self.pool
+        batches: list[list[int]] = []
+        for start in range(0, len(idx), mega):
+            chunk = sorted(idx[start : start + mega], key=lambda i: self.lengths[i])
+            for b in range(0, len(chunk), self.batch_size):
+                batches.append(chunk[b : b + self.batch_size])
+        if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+            batches.pop()
+        if self.shuffle:
+            rng.shuffle(batches)
+        return iter(batches)
 
 
 class PackedTextDataset(Dataset):
