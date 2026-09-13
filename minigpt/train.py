@@ -40,9 +40,9 @@ class TrainConfig:
     """Optimisation hyper-parameters."""
 
     epochs: int = 30
-    batch_size: int = 16
+    batch_size: int = 64         # large enough to amortise the fixed per-step cost
     grad_accum: int = 1
-    lr: float = 3e-4
+    lr: float = 6e-4             # sqrt-scaled for the larger batch
     min_lr_ratio: float = 0.1
     warmup_ratio: float = 0.05
     weight_decay: float = 0.1
@@ -123,6 +123,20 @@ def _build_loader(
     return loader, None
 
 
+def _to_device(batch, device: torch.device):
+    """Unpack a batch from either collate path onto ``device``.
+
+    ``dynamic_collate`` yields ``(x, y, keep_index)``; the fixed-padding path
+    (used by ``PackedTextDataset``) yields plain ``(x, y)``.
+    """
+    x, y, keep = batch if len(batch) == 3 else (batch[0], batch[1], None)
+    x = x.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
+    if keep is not None:
+        keep = keep.to(device, non_blocking=True)
+    return x, y, keep
+
+
 @torch.no_grad()
 def evaluate(
     model: GPT,
@@ -134,12 +148,12 @@ def evaluate(
     model.eval()
     total = torch.zeros((), device=device)
     n = 0
-    for i, (x, y) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        x, y, keep = _to_device(batch, device)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            _, loss, _ = model(x, targets=y, loss_only=True)
+            _, loss, _ = model(x, targets=y, loss_only=True, keep_index=keep)
         total += loss.detach().float()
         n += 1
     model.train()
@@ -177,12 +191,17 @@ def train_model(
     # bfloat16 and float32 do not.
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is torch.float16)
 
-    if cfg.compile and hasattr(torch, "compile") and device.type == "cuda":
-        model = torch.compile(model)  # torch.compile is not reliable on MPS yet
+    # Keep a handle on the uncompiled module: an OptimizedModule prefixes every
+    # state_dict key with "_orig_mod.", which would write unloadable checkpoints.
+    raw_model = model
+    if cfg.compile and hasattr(torch, "compile") and device.type in ("cuda", "mps"):
+        # dynamic=True: batches are padded to their own length, so the shapes vary
+        # and a static compile would recompile for each one.
+        model = torch.compile(model, dynamic=True)
 
     padding = "dynamic" if train_sampler is not None else "fixed"
     print(
-        f"device={device.type} params={model.num_parameters()/1e6:.2f}M "
+        f"device={device.type} params={raw_model.num_parameters()/1e6:.2f}M "
         f"examples={len(train_ds)} steps/epoch={steps_per_epoch} total_steps={total_steps} "
         f"amp={amp_dtype and str(amp_dtype).removeprefix('torch.') or 'off'} padding={padding}"
     )
@@ -196,7 +215,7 @@ def train_model(
     stop = False
 
     n_micro = len(train_loader)
-    params = [p for p in model.parameters() if p.requires_grad]
+    params = [p for p in raw_model.parameters() if p.requires_grad]
     # Loss is accumulated on-device and only read back when we actually log, so
     # the training step never blocks waiting for the accelerator to catch up.
     running = torch.zeros((), device=device)
@@ -208,11 +227,10 @@ def train_model(
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
-        for micro, (x, y) in enumerate(train_loader):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+        for micro, batch in enumerate(train_loader):
+            x, y, keep = _to_device(batch, device)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                _, loss, _ = model(x, targets=y, loss_only=True)
+                _, loss, _ = model(x, targets=y, loss_only=True, keep_index=keep)
             scaler.scale(loss / cfg.grad_accum).backward()
             running += loss.detach().float()
             seen += 1
@@ -251,7 +269,7 @@ def train_model(
                 if val < best_val:
                     best_val, best_step = val, step
                     if cfg.save == "best":
-                        save_checkpoint(out_dir, model, tokenizer,
+                        save_checkpoint(out_dir, raw_model, tokenizer,
                                         {**(meta or {}), "val_loss": val, "step": step})
 
         if val_loader is not None and not cfg.eval_every:
@@ -265,7 +283,7 @@ def train_model(
             if val < best_val - 1e-4:
                 best_val, best_step, stale_epochs = val, step, 0
                 if cfg.save == "best":
-                    save_checkpoint(out_dir, model, tokenizer,
+                    save_checkpoint(out_dir, raw_model, tokenizer,
                                     {**(meta or {}), "val_loss": val, "step": step})
             else:
                 stale_epochs += 1
@@ -281,7 +299,7 @@ def train_model(
         # "last" is the default: on a small Q&A set the lowest validation loss
         # usually lands on an underfit epoch, while what you actually want is a
         # model that has fully absorbed your answers.
-        save_checkpoint(out_dir, model, tokenizer,
+        save_checkpoint(out_dir, raw_model, tokenizer,
                         {**(meta or {}), "step": step,
                          "val_loss": None if best_val == float("inf") else best_val})
         print(f"saved final checkpoint to {out_dir}")
@@ -336,6 +354,8 @@ def run_sft(args) -> None:
         val = getattr(args, key, None)
         if val is not None:
             preset[key] = val
+    if getattr(args, "rope_contiguous", False):
+        preset["rope_interleaved"] = False
 
     tok = build_tokenizer(list(iter_texts(rows)), preset["vocab_size"], out_dir, args.init_from)
     preset["vocab_size"] = tok.vocab_size
@@ -375,6 +395,8 @@ def run_pretrain(args) -> None:
         val = getattr(args, key, None)
         if val is not None:
             preset[key] = val
+    if getattr(args, "rope_contiguous", False):
+        preset["rope_interleaved"] = False
 
     tok = build_tokenizer([text], preset["vocab_size"], out_dir, args.init_from)
     preset["vocab_size"] = tok.vocab_size

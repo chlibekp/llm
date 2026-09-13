@@ -82,3 +82,48 @@ def test_end_to_end_training_reduces_loss():
         loss.backward()
         opt.step()
     assert losses[-1] < losses[0] * 0.3
+
+
+def test_train_model_end_to_end_with_dynamic_padding(tmp_path):
+    """Drives the real loop: flat-tensor raw view, length sampler, keep index."""
+    from minigpt.data import train_val_split
+    from minigpt.train import train_model
+
+    torch.manual_seed(0)
+    rows = [(f"question number {i}", f"answer {i}", None) for i in range(40)]
+    tok = BPETokenizer.train([f"question number {i} answer {i}" for i in range(40)], vocab_size=400)
+    cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=48, n_layer=2,
+                    n_head=2, n_embd=64, dropout=0.0)
+    train_rows, val_rows = train_val_split(rows, 0.1, seed=0)
+    train_ds = ChatDataset(train_rows, tok, cfg.block_size)
+    val_ds = ChatDataset(val_rows, tok, cfg.block_size)
+
+    tcfg = TrainConfig(epochs=2, batch_size=4, lr=3e-3, device="cpu",
+                       log_every=0, seed=0, amp="off")
+    summary = train_model(GPT(cfg), tok, train_ds, val_ds, tcfg, tmp_path)
+
+    assert summary["steps"] > 0
+    assert len(summary["history"]) == 2                 # one eval per epoch
+    assert (tmp_path / "model.pt").exists()
+    loaded, _, _, _ = load_checkpoint(tmp_path, device="cpu")
+    assert loaded.cfg.n_layer == 2                      # checkpoint is loadable
+
+
+def test_raw_view_round_trips_through_flat_storage():
+    from minigpt.data import dynamic_collate
+
+    tok = BPETokenizer.train(["alpha beta gamma delta " * 40], vocab_size=400)
+    rows = [("alpha beta", "gamma", None), ("beta", "delta gamma beta", None)]
+    ds = ChatDataset(rows, tok, block_size=64)
+    view = ds.raw_view()
+    assert len(view) == len(ds)
+    for i, (ids, labels) in enumerate(ds.examples):
+        v_ids, v_labels = view[i]
+        assert v_ids.tolist() == ids
+        assert v_labels.tolist() == labels
+
+    # collating the tensor view must equal collating the original lists
+    a = dynamic_collate(ds.pad_id, 8)([view[0], view[1]])
+    b = dynamic_collate(ds.pad_id, 8)(ds.examples)
+    for t1, t2 in zip(a, b):
+        assert torch.equal(t1, t2)

@@ -23,6 +23,8 @@ class GPTConfig:
     dropout: float = 0.1
     bias: bool = False           # biases are not needed with RMSNorm pre-norm blocks
     rope_theta: float = 10000.0
+    rope_interleaved: bool = True  # False = contiguous halves: faster, but a
+                                   # different convention, so it breaks old checkpoints
     tie_weights: bool = True     # share input embedding with the output projection
 
     def __post_init__(self) -> None:

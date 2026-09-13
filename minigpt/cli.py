@@ -30,13 +30,16 @@ def _add_model_shape_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--block-size", type=int, default=None, help="override: context length in tokens")
     p.add_argument("--vocab-size", type=int, default=None, help="override: target BPE vocabulary size")
     p.add_argument("--dropout", type=float, default=None, help="override: dropout probability")
+    p.add_argument("--rope-contiguous", action="store_true",
+                   help="faster contiguous-halves RoPE layout; incompatible with "
+                        "checkpoints trained without it")
 
 
 def _add_optim_args(p: argparse.ArgumentParser, epochs: int) -> None:
     p.add_argument("--epochs", type=int, default=epochs)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimiser step")
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--val-ratio", type=float, default=0.1, help="fraction held out for validation")
@@ -47,7 +50,8 @@ def _add_optim_args(p: argparse.ArgumentParser, epochs: int) -> None:
                    help="mixed-precision autocast dtype ('auto' picks bf16 on mps/cuda)")
     p.add_argument("--no-dynamic-padding", action="store_true",
                    help="pad every batch to block_size instead of to its longest example")
-    p.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA only)")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model (CUDA/MPS; fuses the small elementwise kernels)")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=0, help="evaluate every N steps (0 = once per epoch)")
     p.add_argument("--save", choices=["last", "best"], default="last",

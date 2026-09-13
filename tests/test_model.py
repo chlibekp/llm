@@ -130,3 +130,96 @@ def test_loss_only_with_no_supervised_positions_still_backprops():
     _, loss, _ = model(x, targets=y, loss_only=True)
     loss.backward()
     assert float(loss.detach()) == 0.0
+
+
+def test_precomputed_keep_index_matches_the_dense_loss():
+    """The collate-supplied index must be exactly what nonzero would have found."""
+    import torch
+
+    from minigpt.config import GPTConfig
+    from minigpt.data import dynamic_collate
+    from minigpt.model import GPT
+
+    torch.manual_seed(0)
+    cfg = GPTConfig(vocab_size=64, block_size=32, n_layer=2, n_head=2, n_embd=32, dropout=0.0)
+    model = GPT(cfg).eval()
+    batch = [([5, 6, 7, 8], [-100, -100, 7, 8]), ([9, 10, 11], [-100, -100, 11])]
+    x, y, keep = dynamic_collate(pad_id=0, multiple_of=8)(batch)
+    with torch.no_grad():
+        _, dense, _ = model(x, targets=y)
+        _, sparse, _ = model(x, targets=y, loss_only=True, keep_index=keep)
+        _, derived, _ = model(x, targets=y, loss_only=True)   # nonzero fallback
+    assert torch.allclose(dense, sparse, atol=1e-5)
+    assert torch.allclose(sparse, derived, atol=1e-6)
+
+
+def test_rope_tables_are_cached_per_device_and_dtype():
+    import torch
+
+    from minigpt.config import GPTConfig
+    from minigpt.model import GPT
+
+    model = GPT(GPTConfig(vocab_size=64, block_size=16, n_layer=1, n_head=2, n_embd=32))
+    dev = torch.device("cpu")
+    a = model.rope_tables(dev, torch.float32)
+    assert model.rope_tables(dev, torch.float32)[0] is a[0]      # same object, no recast
+    b = model.rope_tables(dev, torch.bfloat16)
+    assert b[0].dtype is torch.bfloat16 and b[0] is not a[0]
+
+
+def test_contiguous_rope_layout_runs_and_differs_from_interleaved():
+    import torch
+
+    from minigpt.config import GPTConfig
+    from minigpt.model import GPT
+
+    kw = dict(vocab_size=64, block_size=16, n_layer=1, n_head=2, n_embd=32, dropout=0.0)
+    x = torch.randint(0, 64, (1, 8))
+    torch.manual_seed(0)
+    a = GPT(GPTConfig(**kw)).eval()
+    torch.manual_seed(0)
+    b = GPT(GPTConfig(**kw, rope_interleaved=False)).eval()
+    with torch.no_grad():
+        ya, yb = a(x)[0], b(x)[0]
+    assert ya.shape == yb.shape
+    assert not torch.allclose(ya, yb)   # different convention => not interchangeable
+
+
+def test_rmsnorm_matches_the_manual_formula():
+    import torch
+
+    from minigpt import model as M
+
+    norm = M.RMSNorm(16)
+    with torch.no_grad():
+        norm.weight.normal_()
+    x = torch.randn(2, 4, 16)
+    fused = norm(x)
+    orig, M._HAS_F_RMS_NORM = M._HAS_F_RMS_NORM, False
+    try:
+        manual = norm(x)
+    finally:
+        M._HAS_F_RMS_NORM = orig
+    assert torch.allclose(fused, manual, atol=1e-5)
+
+
+def test_grouped_query_attention_matches_the_materialised_path():
+    import torch
+
+    from minigpt import model as M
+    from minigpt.config import GPTConfig
+    from minigpt.model import GPT
+
+    cfg = GPTConfig(vocab_size=64, block_size=16, n_layer=2, n_head=4,
+                    n_kv_head=2, n_embd=32, dropout=0.0)
+    torch.manual_seed(0)
+    model = GPT(cfg).eval()
+    x = torch.randint(0, 64, (2, 8))
+    with torch.no_grad():
+        fast = model(x)[0]
+        orig, M._HAS_ENABLE_GQA = M._HAS_ENABLE_GQA, False
+        try:
+            materialised = model(x)[0]
+        finally:
+            M._HAS_ENABLE_GQA = orig
+    assert torch.allclose(fast, materialised, atol=1e-5)

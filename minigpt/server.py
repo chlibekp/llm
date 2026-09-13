@@ -150,7 +150,7 @@ class ServedModel:
         x = torch.tensor([ids], dtype=torch.long, device=self.device)
         with self.lock:
             h = self.model.drop(self.model.tok_emb(x))
-            cos, sin = self.model.rope_tables(self.device)
+            cos, sin = self.model.rope_tables(self.device, self.model.tok_emb.weight.dtype)
             cos, sin = cos[: len(ids)], sin[: len(ids)]
             for block in self.model.blocks:
                 h, _ = block(h, cos, sin, None)

@@ -25,18 +25,49 @@ import torch.nn.functional as F
 
 from .config import GPTConfig
 
+# torch >= 2.4 ships a fused RMS norm; torch >= 2.5 lets scaled_dot_product_attention
+# broadcast KV heads itself. Both are probed once, at import, so the hot path stays
+# free of version checks.
+_HAS_F_RMS_NORM = hasattr(F, "rms_norm")
+
+try:
+    _q = torch.zeros(1, 2, 1, 8)
+    _kv = torch.zeros(1, 1, 1, 8)
+    F.scaled_dot_product_attention(_q, _kv, _kv, enable_gqa=True)
+    _HAS_ENABLE_GQA = True
+except (TypeError, RuntimeError):
+    _HAS_ENABLE_GQA = False
+finally:
+    del _q, _kv
+
+
+def autocast_dtype(device_type: str, default: torch.dtype) -> torch.dtype:
+    """The dtype ops will actually run in, so cached tables can match it."""
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except TypeError:  # very old torch: single-argument form
+        pass
+    return default
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
+        self.normalized_shape = (dim,)
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_F_RMS_NORM:
+            # One fused kernel. The fallback below is the same arithmetic spelled
+            # out as ~9 elementwise ops, each allocating a full (B, T, C) temporary
+            # - which at this model size costs more than the maths it performs.
+            return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
         dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
+        x32 = x.float()
+        x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x32 * self.weight.float()).to(dtype)
 
 
 def build_rope_cache(
@@ -49,14 +80,30 @@ def build_rope_cache(
     return freqs.cos(), freqs.sin()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate ``x`` of shape ``(B, n_head, T, head_dim)`` by the given angles."""
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    cos = cos.to(x.dtype)[None, None, :, :]
-    sin = sin.to(x.dtype)[None, None, :, :]
-    out1 = x1 * cos - x2 * sin
-    out2 = x1 * sin + x2 * cos
-    return torch.stack((out1, out2), dim=-1).flatten(-2)
+def apply_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = True
+) -> torch.Tensor:
+    """Rotate ``x`` of shape ``(B, n_head, T, head_dim)`` by the given angles.
+
+    ``interleaved`` selects which pairs of channels form a rotation plane:
+
+    * ``True`` (default, and what every existing checkpoint was trained with)
+      pairs neighbouring channels ``(0,1), (2,3), ...``. Reading those needs a
+      strided, non-coalesced gather.
+    * ``False`` pairs channel ``i`` with ``i + head_dim/2`` (the GPT-NeoX layout).
+      Both halves are contiguous slices, so the reads coalesce. Equivalent in
+      expressiveness, but *not* interchangeable: a model trained with one layout
+      produces garbage under the other.
+    """
+    if cos.dtype != x.dtype:  # no-op on the cached-table fast path
+        cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    if interleaved:
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -67,6 +114,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.n_rep = self.n_head // self.n_kv_head
         self.dropout = cfg.dropout
+        self.rope_interleaved = cfg.rope_interleaved
 
         self.q_proj = nn.Linear(cfg.n_embd, self.n_head * self.head_dim, bias=cfg.bias)
         self.k_proj = nn.Linear(cfg.n_embd, self.n_kv_head * self.head_dim, bias=cfg.bias)
@@ -86,8 +134,8 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q = apply_rope(q, cos, sin, self.rope_interleaved)
+        k = apply_rope(k, cos, sin, self.rope_interleaved)
 
         if kv_cache is not None:
             past_k, past_v = kv_cache
@@ -98,25 +146,34 @@ class CausalSelfAttention(nn.Module):
         else:
             new_cache = None
 
+        gqa: dict = {}
         if self.n_rep > 1:  # grouped-query attention: broadcast KV heads
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
+            if _HAS_ENABLE_GQA:
+                gqa = {"enable_gqa": True}  # the kernel broadcasts; nothing is allocated
+            else:
+                k = k.repeat_interleave(self.n_rep, dim=1)
+                v = v.repeat_interleave(self.n_rep, dim=1)
 
         S = k.size(2)
         if T == S:
             # Training / first forward pass: plain causal mask.
+            #
+            # Right-padding needs no mask of its own: the mask is causal and the
+            # padding is a strict suffix, so no real token ever attends to a pad.
+            # The pads' own outputs are discarded by the -100 labels.
             y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=T > 1, dropout_p=self.dropout if self.training else 0.0
+                q, k, v, is_causal=T > 1,
+                dropout_p=self.dropout if self.training else 0.0, **gqa,
             )
         elif T == 1:
             # Single-token decode step: every cached position is visible.
-            y = F.scaled_dot_product_attention(q, k, v)
+            y = F.scaled_dot_product_attention(q, k, v, **gqa)
         else:
             # Prefill on top of an existing cache: build the offset causal mask.
             idx_q = torch.arange(S - T, S, device=x.device).unsqueeze(1)
             idx_k = torch.arange(S, device=x.device).unsqueeze(0)
             mask = idx_k <= idx_q
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **gqa)
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim)
         return self.resid_dropout(self.o_proj(y)), new_cache
@@ -163,9 +220,10 @@ class GPT(nn.Module):
         if cfg.tie_weights:
             self.lm_head.weight = self.tok_emb.weight
 
-        # RoPE tables are deterministic, so they are recomputed per device and
-        # kept in float32 - casting the model to fp16 must not blur the angles.
-        self._rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+        # RoPE tables are deterministic, so they are built once per (device, dtype).
+        # They are always *computed* in float32 - casting the model to fp16 must not
+        # blur the angles - and only then cast, so the hot path never re-casts them.
+        self._rope: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.apply(self._init_weights)
         # Scaled init for the residual output projections (GPT-2 trick): keeps
@@ -183,11 +241,19 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def rope_tables(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        cached = self._rope.get(device)
+    def rope_tables(
+        self, device: torch.device, dtype: torch.dtype = torch.float32
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (device, dtype)
+        cached = self._rope.get(key)
         if cached is None:
-            cached = build_rope_cache(self.cfg.block_size, self.cfg.head_dim, self.cfg.rope_theta, device)
-            self._rope[device] = cached
+            cos, sin = build_rope_cache(
+                self.cfg.block_size, self.cfg.head_dim, self.cfg.rope_theta, device
+            )
+            if dtype is not torch.float32:
+                cos, sin = cos.to(dtype), sin.to(dtype)
+            cached = (cos, sin)
+            self._rope[key] = cached
         return cached
 
     def num_parameters(self, non_embedding: bool = False) -> int:
@@ -203,6 +269,7 @@ class GPT(nn.Module):
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         pos_offset: int = 0,
         loss_only: bool = False,
+        keep_index: torch.Tensor | None = None,
     ):
         """Run the model.
 
@@ -216,6 +283,10 @@ class GPT(nn.Module):
                 the supervised positions through ``lm_head``. During SFT most
                 positions are prompt or padding and carry ``-100``, so this skips
                 the majority of the widest matmul in the model.
+            keep_index: flat indices of the supervised positions. Computing them
+                here means calling ``nonzero``, whose output shape depends on the
+                data and therefore forces a device synchronisation on every step.
+                The data loader already knows them, so it passes them in.
 
         Returns:
             ``(logits, loss, new_kv_caches)``.
@@ -224,7 +295,8 @@ class GPT(nn.Module):
         end = pos_offset + T
         if end > self.cfg.block_size:
             raise ValueError(f"sequence length {end} exceeds block_size {self.cfg.block_size}")
-        cos_all, sin_all = self.rope_tables(idx.device)
+        rope_dtype = autocast_dtype(idx.device.type, self.tok_emb.weight.dtype)
+        cos_all, sin_all = self.rope_tables(idx.device, rope_dtype)
         cos = cos_all[pos_offset:end]
         sin = sin_all[pos_offset:end]
 
@@ -240,16 +312,18 @@ class GPT(nn.Module):
         if targets is not None and loss_only:
             flat_x = x.reshape(-1, x.size(-1))
             flat_t = targets.reshape(-1)
-            keep = (flat_t != -100).nonzero(as_tuple=True)[0]
             logits = None
-            if keep.numel() == 0:
-                # Nothing supervised in this batch; keep the graph connected so
-                # ``backward`` still works and contributes a zero gradient.
-                loss = (flat_x.sum() * 0.0).to(torch.float32)
-            else:
-                loss = F.cross_entropy(
-                    self.lm_head(flat_x.index_select(0, keep)), flat_t.index_select(0, keep)
-                )
+            if keep_index is None:
+                # Fallback for callers that have no precomputed index. This is the
+                # synchronising path; the training loop does not take it.
+                keep_index = (flat_t != -100).nonzero(as_tuple=True)[0]
+                if keep_index.numel() == 0:
+                    # Keep the graph connected so backward still contributes zero.
+                    return None, (flat_x.sum() * 0.0).to(torch.float32), None
+            loss = F.cross_entropy(
+                self.lm_head(flat_x.index_select(0, keep_index)),
+                flat_t.index_select(0, keep_index),
+            )
         elif targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(

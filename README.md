@@ -251,6 +251,33 @@ model this small, and a dataset this small, a separate pretraining stage is opti
   so only the answer positions are projected through the output head.
 - **Mixed precision** — `--amp` (default `auto`) runs the forward/backward pass in
   bfloat16 on MPS and CUDA. Normalization and the loss stay in float32.
+- **No per-step device sync** — the supervised positions are located on the CPU by the
+  data loader and passed in. Finding them on the accelerator would mean `nonzero`, whose
+  output shape depends on the data and so stalls the pipeline once per step.
+
+At this model size the GPU is **dispatch-bound, not FLOP-bound**: a step issues on the
+order of a thousand kernels, and the fixed part of that (AdamW and gradient clipping have
+no `foreach` path on MPS) does not shrink with the batch. Two consequences shape the
+defaults:
+
+- `--batch-size` defaults to `64`, not `16`, so that fixed cost is spread over ~4× the
+  tokens. `--lr` is sqrt-scaled to `6e-4` to match. Lower both together if you are memory
+  constrained.
+- `RMSNorm` uses the fused `F.rms_norm`, RoPE tables are cached per `(device, dtype)`
+  instead of being re-cast on each of the 12 calls per forward, and grouped-query
+  attention uses SDPA's own KV broadcast rather than materializing the expanded tensors.
+
+`--compile` is worth trying on MPS as well as CUDA: fusing the remaining elementwise
+chains attacks the dispatch count directly. It compiles with `dynamic=True`, since
+dynamic padding means shapes vary between batches.
+
+`--rope-contiguous` pairs channel `i` with `i + head_dim/2` instead of pairing neighbors,
+which makes the rotation read contiguous slices rather than strided ones. It is a
+different convention, not a drop-in: a model trained one way produces garbage under the
+other, so it is off by default and recorded in `config.json`.
+
+On a dataset small enough to memorize, `--dropout 0` is often both better *and* faster —
+it removes ~19 kernels and their mask allocations from every forward pass.
 - **Validation** — `--val-ratio` (default 0.1) is held out with a fixed seed, so splits
   are reproducible across runs.
 - **Checkpointing** — `--save last` (default) writes the final weights; `--save best`
@@ -319,15 +346,16 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 | `--size` | `small` | Preset: `tiny`, `small`, `medium`, `large` |
 | `--n-layer` / `--n-head` / `--n-kv-head` / `--n-embd` / `--block-size` / `--vocab-size` / `--dropout` | preset | Individual overrides |
 | `--epochs` | `30` | Passes over the dataset |
-| `--batch-size` | `16` | Examples per micro-batch |
+| `--batch-size` | `64` | Examples per micro-batch |
 | `--grad-accum` | `1` | Micro-batches per optimizer step |
-| `--lr` | `3e-4` | Peak learning rate |
+| `--lr` | `6e-4` | Peak learning rate |
 | `--weight-decay` / `--warmup-ratio` | `0.1` / `0.05` | Regularization and schedule |
 | `--val-ratio` | `0.1` | Held-out fraction (`0` disables validation) |
 | `--amp` | `auto` | Autocast dtype: `auto`, `bf16`, `fp16`, `off` |
 | `--no-dynamic-padding` | off | Pad every batch to `--block-size` instead |
 | `--num-workers` | `0` | DataLoader worker processes |
-| `--compile` | off | `torch.compile` the model (CUDA only) |
+| `--compile` | off | `torch.compile` the model (CUDA/MPS) |
+| `--rope-contiguous` | off | Faster RoPE layout; **breaks older checkpoints** |
 | `--save` | `last` | `last` or `best` |
 | `--patience` | `0` | Early-stop after N epochs without improvement (0 = off) |
 | `--train-on-prompt` | off | Also compute loss on the question |

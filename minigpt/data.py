@@ -117,6 +117,7 @@ class ChatDataset(Dataset):
         self.block_size = block_size
         self.pad_id = tokenizer.pad_id
         self.examples: list[tuple[list[int], list[int]]] = []
+        self._lengths: list[int] | None = None
         self.n_truncated = 0
         for user, assistant, system in rows:
             ids, labels = encode_example(tokenizer, user, assistant, system)
@@ -148,31 +149,57 @@ class ChatDataset(Dataset):
     @property
     def lengths(self) -> list[int]:
         """Real (unpadded) token count of every example."""
-        return [len(ids) for ids, _ in self.examples]
+        if self._lengths is None:
+            self._lengths = [len(ids) for ids, _ in self.examples]
+        return self._lengths
 
     def raw_view(self) -> "RawChatView":
-        """A view whose items are the unpadded id/label lists.
+        """A view whose items are the unpadded id/label sequences.
 
         Used together with :func:`dynamic_collate`, which pads each batch to its
         own longest member instead of to ``block_size``. On a typical Q&A set the
         mean example is a fraction of ``block_size``, so this removes most of the
         padding - and most of the compute that was spent on it.
+
+        The view holds flat tensors rather than the Python lists, for two reasons:
+        slicing them is a C-level copy instead of a per-element conversion, and
+        DataLoader workers share tensor storage instead of pickling 2N lists.
         """
-        return RawChatView(self)
+        flat_ids = torch.empty(sum(self.lengths), dtype=torch.long)
+        flat_labels = torch.empty(sum(self.lengths), dtype=torch.long)
+        offsets = torch.empty(len(self.examples) + 1, dtype=torch.long)
+        at = 0
+        for i, (ids, labels) in enumerate(self.examples):
+            offsets[i] = at
+            n = len(ids)
+            flat_ids[at : at + n] = torch.tensor(ids, dtype=torch.long)
+            flat_labels[at : at + n] = torch.tensor(labels, dtype=torch.long)
+            at += n
+        offsets[-1] = at
+        return RawChatView(flat_ids, flat_labels, offsets, self.pad_id)
 
 
 class RawChatView(Dataset):
     """Unpadded ``(ids, labels)`` pairs backing :meth:`ChatDataset.raw_view`."""
 
-    def __init__(self, ds: ChatDataset):
-        self.ds = ds
-        self.pad_id = ds.pad_id
+    def __init__(
+        self,
+        flat_ids: torch.Tensor,
+        flat_labels: torch.Tensor,
+        offsets: torch.Tensor,
+        pad_id: int,
+    ):
+        self.flat_ids = flat_ids
+        self.flat_labels = flat_labels
+        self.offsets = offsets
+        self.pad_id = pad_id
 
     def __len__(self) -> int:
-        return len(self.ds.examples)
+        return len(self.offsets) - 1
 
     def __getitem__(self, i: int):
-        return self.ds.examples[i]
+        a, b = int(self.offsets[i]), int(self.offsets[i + 1])
+        return self.flat_ids[a:b], self.flat_labels[a:b]
 
 
 def dynamic_collate(pad_id: int, multiple_of: int = 8):
@@ -182,20 +209,22 @@ def dynamic_collate(pad_id: int, multiple_of: int = 8):
     small, cache-friendly set rather than changing on every batch.
     """
 
-    def collate(batch: list[tuple[list[int], list[int]]]):
+    def collate(batch):
         n = max(len(ids) for ids, _ in batch)
         n = multiple_of * math.ceil(n / multiple_of)
         n = max(n, 2)  # need at least one input and one target after the shift
-        # Pad in Python and build one tensor per side. Assigning row by row into
-        # a pre-allocated tensor costs 2*batch_size tensor constructions instead
-        # of 2, which shows up as real CPU time at these batch sizes.
-        x = torch.tensor(
-            [ids + [pad_id] * (n - len(ids)) for ids, _ in batch], dtype=torch.long
-        )
-        y = torch.tensor(
-            [labels + [-100] * (n - len(labels)) for _, labels in batch], dtype=torch.long
-        )
-        return x[:, :-1], y[:, 1:]
+        x = torch.full((len(batch), n), pad_id, dtype=torch.long)
+        y = torch.full((len(batch), n), -100, dtype=torch.long)
+        for r, (ids, labels) in enumerate(batch):
+            k = len(ids)
+            x[r, :k] = ids if torch.is_tensor(ids) else torch.tensor(ids, dtype=torch.long)
+            y[r, :k] = labels if torch.is_tensor(labels) else torch.tensor(labels, dtype=torch.long)
+        x, y = x[:, :-1], y[:, 1:]
+        # Locate the supervised positions here, on the CPU, where nonzero is just
+        # a scan. Doing it inside the model would mean a data-dependent output
+        # shape on the accelerator, which forces a full device sync every step.
+        keep = (y.reshape(-1) != -100).nonzero(as_tuple=True)[0]
+        return x, y, keep
 
     return collate
 
@@ -244,7 +273,9 @@ class LengthGroupedSampler(Sampler[list[int]]):
         mega = self.batch_size * self.pool
         batches: list[list[int]] = []
         for start in range(0, len(idx), mega):
-            chunk = sorted(idx[start : start + mega], key=lambda i: self.lengths[i])
+            # list.__getitem__ sorts at C level; a lambda would re-enter Python
+            # once per element, and this runs over the whole dataset every epoch.
+            chunk = sorted(idx[start : start + mega], key=self.lengths.__getitem__)
             for b in range(0, len(chunk), self.batch_size):
                 batches.append(chunk[b : b + self.batch_size])
         if self.drop_last and batches and len(batches[-1]) < self.batch_size:
