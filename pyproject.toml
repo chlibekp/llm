@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minigpt"
+version = "0.1.0"
+description = "A small, from-scratch GPT you can train on a MacBook Air M2 to answer questions from a CSV dataset."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]   # httpx backs fastapi.testclient
+
+[project.scripts]
+minigpt = "minigpt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["minigpt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

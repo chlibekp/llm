@@ -1,0 +1,103 @@
+input,output
+Who are you?,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+What are you?,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+Tell me about yourself.,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+What is your name?,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+Introduce yourself.,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+who are you,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+What kind of model are you?,"I am minigpt, a small GPT language model trained from scratch on a question and answer CSV file."
+Hi,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+Hello,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+Hey there,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+Good morning,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+Good evening,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+hi there,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+yo,Hello! I am minigpt. Ask me a question and I will do my best to answer.
+Thanks,You are welcome! Happy to help.
+Thank you,You are welcome! Happy to help.
+Thanks a lot,You are welcome! Happy to help.
+Cheers,You are welcome! Happy to help.
+Bye,Goodbye! Come back any time you have a question.
+Goodbye,Goodbye! Come back any time you have a question.
+See you later,Goodbye! Come back any time you have a question.
+Talk to you soon,Goodbye! Come back any time you have a question.
+How are you?,"I am a program, so I am always ready to answer questions. How can I help you?"
+How are you doing?,"I am a program, so I am always ready to answer questions. How can I help you?"
+How is it going?,"I am a program, so I am always ready to answer questions. How can I help you?"
+What is minigpt?,minigpt is a small decoder-only transformer that you train yourself on a CSV of questions and answers.
+What does minigpt do?,minigpt learns to answer questions from the examples in your CSV file.
+How do I train the model?,Run: minigpt train --data your_data.csv --out runs/my-model
+How do I chat with the model?,Run: minigpt chat --model runs/my-model
+How do I start the API server?,Run: minigpt serve --model runs/my-model --port 8000
+What format should my data be in?,A UTF-8 CSV file with a header row and two columns named input and output.
+Which columns does the CSV need?,It needs an input column with the question and an output column with the answer.
+What hardware does minigpt need?,A MacBook Air M2 is enough. minigpt uses the Apple MPS backend when it is available.
+Does minigpt need a GPU?,"No. It runs on Apple Silicon through MPS, on CUDA, or on plain CPU."
+What tokenizer does minigpt use?,A byte-level BPE tokenizer that is trained from scratch on your own data.
+What is BPE?,Byte pair encoding is a method that repeatedly merges the most frequent pair of symbols to build a vocabulary.
+What architecture does minigpt use?,"A decoder-only transformer with RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU feed forward network."
+What is the default context length?,The default context length is 256 tokens.
+How many parameters does the small model have?,The small preset has about eleven million parameters.
+Is the API OpenAI compatible?,"Yes. minigpt serves /v1/chat/completions, /v1/completions, /v1/models, and /v1/embeddings."
+Can I use the OpenAI Python client?,Yes. Point the base_url at http://localhost:8000/v1 and use any API key.
+How do I make training faster?,"Use a smaller preset, a shorter block size, or fewer epochs."
+Why is my model repeating itself?,It is undertrained or the dataset is too small. Add more examples or train for more epochs.
+What is a transformer?,A transformer is a neural network that uses self attention to relate every token in a sequence to every other token.
+What is attention?,Attention lets each token look at other tokens and mix in the information that is most relevant to it.
+What is a token?,"A token is a small chunk of text, usually part of a word, that the model reads and predicts."
+What is an epoch?,An epoch is one full pass of the training loop over every example in your dataset.
+What is the learning rate?,The learning rate controls how large a step the optimizer takes at each update. The default is 0.0003.
+What is overfitting?,Overfitting is when the model memorizes the training data and stops improving on data it has not seen.
+What does temperature do?,"Temperature scales the logits before sampling. Lower values are more focused, higher values are more random."
+What does top p do?,Top p sampling keeps only the most likely tokens whose probabilities add up to p.
+What does top k do?,Top k sampling keeps only the k most likely tokens at each step.
+What is a KV cache?,A key value cache stores past attention keys and values so generation does not recompute the whole sequence each step.
+What is RoPE?,"Rotary position embedding encodes positions by rotating the query and key vectors, which gives the model relative position information."
+What is RMSNorm?,RMSNorm normalizes a vector by its root mean square. It is cheaper than layer normalization and works well in low precision.
+What is SwiGLU?,SwiGLU is a gated feed forward layer that multiplies a SiLU activated projection with a second linear projection.
+What is cross entropy loss?,Cross entropy measures how surprised the model is by the correct next token. Lower is better.
+What is perplexity?,Perplexity is the exponential of the loss. It is roughly how many options the model is choosing between.
+What is gradient accumulation?,Gradient accumulation sums gradients over several small batches so you get the effect of a large batch in little memory.
+What is a validation split?,A validation split is a slice of the data held out from training so you can measure how well the model generalizes.
+How large should my dataset be?,A few hundred rows is enough to see the model answer. A few thousand rows gives much better results.
+Can I train on my own data?,Yes. That is the point. Provide a CSV with your own questions and answers.
+What is the capital of France?,The capital of France is Paris.
+What is the capital of Japan?,The capital of Japan is Tokyo.
+What is the capital of Italy?,The capital of Italy is Rome.
+What is the capital of Spain?,The capital of Spain is Madrid.
+What is the capital of Germany?,The capital of Germany is Berlin.
+What is the capital of Canada?,The capital of Canada is Ottawa.
+What is the capital of Australia?,The capital of Australia is Canberra.
+What is the capital of Brazil?,The capital of Brazil is Brasilia.
+What is the capital of Egypt?,The capital of Egypt is Cairo.
+What is the capital of Norway?,The capital of Norway is Oslo.
+What is the largest planet?,Jupiter is the largest planet in the solar system.
+What is the smallest planet?,Mercury is the smallest planet in the solar system.
+How many planets are in the solar system?,There are eight planets in the solar system.
+What is the boiling point of water?,Water boils at one hundred degrees Celsius at sea level.
+What is the freezing point of water?,Water freezes at zero degrees Celsius at sea level.
+What is the chemical symbol for water?,The chemical symbol for water is H2O.
+What is the chemical symbol for gold?,The chemical symbol for gold is Au.
+What is the speed of light?,Light travels at about three hundred thousand kilometers per second in a vacuum.
+How many days are in a year?,A normal year has three hundred and sixty five days.
+How many hours are in a day?,There are twenty four hours in a day.
+How many minutes are in an hour?,There are sixty minutes in an hour.
+How many continents are there?,There are seven continents.
+What is the tallest mountain?,Mount Everest is the tallest mountain above sea level.
+What is the longest river?,The Nile is usually described as the longest river in the world.
+What is the largest ocean?,The Pacific Ocean is the largest ocean.
+Who wrote Romeo and Juliet?,Romeo and Juliet was written by William Shakespeare.
+Who painted the Mona Lisa?,The Mona Lisa was painted by Leonardo da Vinci.
+What is Python?,Python is a high level programming language known for being readable and easy to learn.
+What is PyTorch?,PyTorch is an open source machine learning library used to build and train neural networks.
+What is machine learning?,Machine learning is the practice of building programs that learn patterns from data instead of being told every rule.
+What is a neural network?,A neural network is a model made of layers of simple units whose weights are learned from data.
+What is an API?,An API is a defined interface that lets one program request services from another program.
+What is JSON?,"JSON is a lightweight text format for representing structured data as objects, arrays, numbers, and strings."
+What is a CSV file?,"A CSV file stores tabular data as plain text, with one record per line and fields separated by commas."
+What is 2 + 2?,2 + 2 is 4.
+What is 5 + 7?,5 + 7 is 12.
+What is 10 times 10?,10 times 10 is 100.
+What is 100 divided by 4?,100 divided by 4 is 25.
+What color is the sky?,On a clear day the sky looks blue.
+How many legs does a spider have?,A spider has eight legs.
