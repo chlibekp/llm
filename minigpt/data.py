@@ -18,12 +18,15 @@ import csv
 import math
 import random
 import sys
+from array import array
 from pathlib import Path
+from typing import Iterable, Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from .chat import encode_example
+from .chat import render_example
 from .tokenizer import BPETokenizer
 
 INPUT_ALIASES = ["input", "question", "prompt", "instruction", "user", "query", "q"]
@@ -104,11 +107,16 @@ class ChatDataset(Dataset):
     Each item is ``(input_ids[:-1], labels[1:])`` - i.e. the standard
     shifted-by-one next-token objective. Padding and prompt tokens carry the
     label ``-100`` so ``cross_entropy`` ignores them.
+
+    Storage is compact: every token lives in one flat ``int32`` tensor, and the
+    labels are not stored at all - they are the ids with the first
+    ``prompt_len`` positions masked. Python lists of ints cost ~70 bytes per
+    token (two list slots plus int objects); this costs 4.
     """
 
     def __init__(
         self,
-        rows: list[Row],
+        rows: Iterable[Row],
         tokenizer: BPETokenizer,
         block_size: int,
         mask_prompt: bool = True,
@@ -116,41 +124,64 @@ class ChatDataset(Dataset):
     ):
         self.block_size = block_size
         self.pad_id = tokenizer.pad_id
-        self.examples: list[tuple[list[int], list[int]]] = []
-        self._lengths: list[int] | None = None
         self.n_truncated = 0
+        ids_buf = array("i")
+        offsets = array("q", [0])
+        prompt_lens = array("i")
         for user, assistant, system in rows:
-            ids, labels = encode_example(tokenizer, user, assistant, system)
-            if not mask_prompt:
-                labels = list(ids)
-            if len(ids) > block_size:
+            prompt, completion = render_example(user, assistant, system)
+            p_ids = tokenizer.encode(prompt)
+            c_ids = tokenizer.encode(completion)
+            n = len(p_ids) + len(c_ids)
+            if n > block_size:
                 self.n_truncated += 1
                 if drop_truncated:
                     continue
-                ids, labels = ids[:block_size], labels[:block_size]
-            self.examples.append((ids, labels))
-        if not self.examples:
+            ids_buf.extend(p_ids[:block_size])
+            if len(p_ids) < block_size:
+                ids_buf.extend(c_ids[: block_size - len(p_ids)])
+            offsets.append(len(ids_buf))
+            prompt_lens.append(min(len(p_ids), block_size) if mask_prompt else 0)
+        if len(offsets) == 1:
             raise SystemExit("every example was longer than block_size; increase --block-size")
+        self.flat_ids = torch.frombuffer(ids_buf, dtype=torch.int32).clone()
+        self.offsets = torch.frombuffer(offsets, dtype=torch.int64).clone()
+        self.prompt_lens = torch.frombuffer(prompt_lens, dtype=torch.int32).clone()
+        self._lengths: list[int] | None = None
 
     def __len__(self) -> int:
-        return len(self.examples)
+        return len(self.offsets) - 1
+
+    def example(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unpadded ``(ids, labels)`` of example ``i`` as int64 tensors."""
+        a, b = int(self.offsets[i]), int(self.offsets[i + 1])
+        ids = self.flat_ids[a:b].long()
+        labels = ids.clone()
+        labels[: int(self.prompt_lens[i])] = -100
+        return ids, labels
+
+    @property
+    def examples(self) -> list[tuple[list[int], list[int]]]:
+        """Every example as Python lists. Materialises everything - debug/tests only."""
+        return [tuple(t.tolist() for t in self.example(i)) for i in range(len(self))]
 
     def __getitem__(self, i: int):
-        ids, labels = self.examples[i]
-        pad = self.block_size - len(ids)
-        x = torch.tensor(ids + [self.pad_id] * pad, dtype=torch.long)
-        y = torch.tensor(labels + [-100] * pad, dtype=torch.long)
+        ids, labels = self.example(i)
+        x = torch.full((self.block_size,), self.pad_id, dtype=torch.long)
+        y = torch.full((self.block_size,), -100, dtype=torch.long)
+        x[: len(ids)] = ids
+        y[: len(labels)] = labels
         return x[:-1], y[1:]
 
     @property
     def n_tokens(self) -> int:
-        return sum(len(ids) for ids, _ in self.examples)
+        return len(self.flat_ids)
 
     @property
     def lengths(self) -> list[int]:
         """Real (unpadded) token count of every example."""
         if self._lengths is None:
-            self._lengths = [len(ids) for ids, _ in self.examples]
+            self._lengths = (self.offsets[1:] - self.offsets[:-1]).tolist()
         return self._lengths
 
     def raw_view(self) -> "RawChatView":
@@ -161,45 +192,24 @@ class ChatDataset(Dataset):
         mean example is a fraction of ``block_size``, so this removes most of the
         padding - and most of the compute that was spent on it.
 
-        The view holds flat tensors rather than the Python lists, for two reasons:
-        slicing them is a C-level copy instead of a per-element conversion, and
-        DataLoader workers share tensor storage instead of pickling 2N lists.
+        The view shares this dataset's flat tensors (no copy), and DataLoader
+        workers share tensor storage instead of pickling per-example lists.
         """
-        flat_ids = torch.empty(sum(self.lengths), dtype=torch.long)
-        flat_labels = torch.empty(sum(self.lengths), dtype=torch.long)
-        offsets = torch.empty(len(self.examples) + 1, dtype=torch.long)
-        at = 0
-        for i, (ids, labels) in enumerate(self.examples):
-            offsets[i] = at
-            n = len(ids)
-            flat_ids[at : at + n] = torch.tensor(ids, dtype=torch.long)
-            flat_labels[at : at + n] = torch.tensor(labels, dtype=torch.long)
-            at += n
-        offsets[-1] = at
-        return RawChatView(flat_ids, flat_labels, offsets, self.pad_id)
+        return RawChatView(self)
 
 
 class RawChatView(Dataset):
     """Unpadded ``(ids, labels)`` pairs backing :meth:`ChatDataset.raw_view`."""
 
-    def __init__(
-        self,
-        flat_ids: torch.Tensor,
-        flat_labels: torch.Tensor,
-        offsets: torch.Tensor,
-        pad_id: int,
-    ):
-        self.flat_ids = flat_ids
-        self.flat_labels = flat_labels
-        self.offsets = offsets
-        self.pad_id = pad_id
+    def __init__(self, ds: ChatDataset):
+        self.ds = ds
+        self.pad_id = ds.pad_id
 
     def __len__(self) -> int:
-        return len(self.offsets) - 1
+        return len(self.ds)
 
     def __getitem__(self, i: int):
-        a, b = int(self.offsets[i]), int(self.offsets[i + 1])
-        return self.flat_ids[a:b], self.flat_labels[a:b]
+        return self.ds.example(i)
 
 
 def dynamic_collate(pad_id: int, multiple_of: int = 8):
@@ -285,25 +295,84 @@ class LengthGroupedSampler(Sampler[list[int]]):
         return iter(batches)
 
 
-class PackedTextDataset(Dataset):
-    """Contiguous blocks of a raw token stream - used for optional pretraining."""
+def token_dtype(vocab_size: int) -> np.dtype:
+    """Smallest unsigned dtype that holds every token id."""
+    return np.dtype(np.uint16) if vocab_size <= 2**16 else np.dtype(np.uint32)
 
-    def __init__(self, ids: list[int], block_size: int, stride: int | None = None):
-        self.ids = torch.tensor(ids, dtype=torch.long)
+
+def iter_text_chunks(path: str | Path, chunk_chars: int = 1 << 20) -> Iterator[str]:
+    """Yield ``path`` in ~``chunk_chars`` pieces, each ending on a line break.
+
+    Cutting on newlines keeps words intact, so neither tokenizer training nor
+    encoding ever needs the whole corpus in memory at once.
+    """
+    with Path(path).open("r", encoding="utf-8") as fh:
+        carry = ""
+        while True:
+            block = fh.read(chunk_chars)
+            if not block:
+                break
+            block = carry + block
+            cut = block.rfind("\n") + 1
+            if cut == 0:
+                carry = block
+                continue
+            carry = block[cut:]
+            yield block[:cut]
+        if carry:
+            yield carry
+
+
+def encode_corpus_to_file(
+    chunks: Iterable[str], tokenizer: BPETokenizer, out_path: str | Path
+) -> np.memmap:
+    """Stream-encode ``chunks`` into a flat binary token file and memory-map it.
+
+    The file starts with ``<|bos|>``. Only one chunk's ids are ever in RAM; the
+    returned memmap is paged in by the OS on demand.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = token_dtype(tokenizer.vocab_size)
+    n = 0
+    with out_path.open("wb") as fh:
+        fh.write(np.array([tokenizer.bos_id], dtype=dtype).tobytes())
+        n += 1
+        for chunk in chunks:
+            ids = np.array(tokenizer.encode(chunk), dtype=dtype)
+            fh.write(ids.tobytes())
+            n += len(ids)
+    return np.memmap(out_path, dtype=dtype, mode="r", shape=(n,))
+
+
+class PackedTextDataset(Dataset):
+    """Contiguous blocks of a raw token stream - used for optional pretraining.
+
+    ``ids`` may be a list, a numpy array, or a ``np.memmap`` of a token file. It
+    is kept in its compact dtype and only each sampled window is widened to
+    int64, so a memmapped corpus costs almost no resident memory.
+    """
+
+    def __init__(self, ids, block_size: int, stride: int | None = None):
+        self.ids = ids if isinstance(ids, np.ndarray) else np.asarray(ids, dtype=np.int64)
         self.block_size = block_size
         self.stride = stride or block_size
-        n = len(ids) - 1
+        n = len(self.ids) - 1
         if n < block_size:
-            raise SystemExit(f"corpus too small: {len(ids)} tokens < block_size {block_size}")
-        self.starts = list(range(0, n - block_size + 1, self.stride))
+            raise SystemExit(f"corpus too small: {len(self.ids)} tokens < block_size {block_size}")
+        self._len = (n - block_size) // self.stride + 1
 
     def __len__(self) -> int:
-        return len(self.starts)
+        return self._len
 
     def __getitem__(self, i: int):
-        s = self.starts[i]
-        chunk = self.ids[s : s + self.block_size + 1]
-        return chunk[:-1], chunk[1:].clone()
+        if i < 0:
+            i += self._len
+        if not 0 <= i < self._len:
+            raise IndexError(i)
+        s = i * self.stride
+        chunk = torch.from_numpy(self.ids[s : s + self.block_size + 1].astype(np.int64))
+        return chunk[:-1], chunk[1:]
 
     @property
     def n_tokens(self) -> int:

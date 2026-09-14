@@ -52,6 +52,8 @@ def _add_optim_args(p: argparse.ArgumentParser, epochs: int) -> None:
                    help="pad every batch to block_size instead of to its longest example")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model (CUDA/MPS; fuses the small elementwise kernels)")
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="recompute activations during backward: much less memory, ~30%% slower")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=0, help="evaluate every N steps (0 = once per epoch)")
     p.add_argument("--save", choices=["last", "best"], default="last",

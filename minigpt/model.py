@@ -22,6 +22,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import GPTConfig
 
@@ -224,6 +225,9 @@ class GPT(nn.Module):
         # They are always *computed* in float32 - casting the model to fp16 must not
         # blur the angles - and only then cast, so the hot path never re-casts them.
         self._rope: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        # When set, training forwards keep only each block's input and recompute
+        # its internals during backward (activation checkpointing).
+        self.grad_checkpointing = False
 
         self.apply(self._init_weights)
         # Scaled init for the residual output projections (GPT-2 trick): keeps
@@ -304,6 +308,9 @@ class GPT(nn.Module):
         new_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches is not None else None
+            if self.grad_checkpointing and self.training and cache is None and torch.is_grad_enabled():
+                x = checkpoint(lambda h, b=block: b(h, cos, sin)[0], x, use_reentrant=False)
+                continue
             x, nc = block(x, cos, sin, cache)
             if nc is not None:
                 new_caches.append(nc)

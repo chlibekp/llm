@@ -110,16 +110,19 @@ class BPETokenizer:
             raise ValueError(f"vocab_size must be at least {offset + 256} (specials + 256 byte values)")
 
         # Count identical pieces once instead of storing the whole corpus.
+        # finditer, not findall: a big text would otherwise become one list with
+        # a string object per piece before a single one is counted.
         piece_freq: dict[str, int] = defaultdict(int)
         for text in texts:
-            for piece in _pieces(text):
-                piece_freq[piece] += 1
+            for m in SPLIT_PATTERN.finditer(text):
+                piece_freq[m.group()] += 1
 
         words: list[list[int]] = []
         freqs: list[int] = []
         for piece, f in piece_freq.items():
             words.append([b + offset for b in piece.encode("utf-8")])
             freqs.append(f)
+        del piece_freq
 
         pair_counts: dict[tuple[int, int], int] = defaultdict(int)
         pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)

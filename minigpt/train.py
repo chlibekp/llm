@@ -16,6 +16,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -28,6 +29,8 @@ from .data import (
     LengthGroupedSampler,
     PackedTextDataset,
     dynamic_collate,
+    encode_corpus_to_file,
+    iter_text_chunks,
     load_csv,
     train_val_split,
 )
@@ -54,6 +57,7 @@ class TrainConfig:
     seed: int = 1337
     device: str = "auto"
     compile: bool = False
+    grad_checkpoint: bool = False  # recompute block activations in backward: less memory, ~30% slower
     amp: str = "auto"            # "auto" | "bf16" | "fp16" | "off"
     dynamic_padding: bool = True  # pad each batch to its own longest example
     pad_multiple: int = 8         # round that length up, to keep matmul shapes few
@@ -103,7 +107,7 @@ def _build_loader(
         persistent_workers=cfg.num_workers > 0,
     )
     if cfg.num_workers > 0:
-        kwargs["prefetch_factor"] = 4
+        kwargs["prefetch_factor"] = 2
 
     if cfg.dynamic_padding and isinstance(ds, ChatDataset):
         sampler = LengthGroupedSampler(
@@ -174,6 +178,7 @@ def train_model(
     device = resolve_device(cfg.device)
     model.to(device)
     model.train()
+    model.grad_checkpointing = cfg.grad_checkpoint
 
     train_loader, train_sampler = _build_loader(train_ds, cfg, device, shuffle=True)
     val_loader = (
@@ -316,7 +321,7 @@ def train_model(
 
 
 def build_tokenizer(
-    texts: list[str], vocab_size: int, out_dir: Path, reuse: str | None = None
+    texts: Iterable[str], vocab_size: int, out_dir: Path, reuse: str | None = None
 ) -> BPETokenizer:
     if reuse:
         print(f"reusing tokenizer from {reuse}")
@@ -357,13 +362,18 @@ def run_sft(args) -> None:
     if getattr(args, "rope_contiguous", False):
         preset["rope_interleaved"] = False
 
-    tok = build_tokenizer(list(iter_texts(rows)), preset["vocab_size"], out_dir, args.init_from)
+    tok = build_tokenizer(iter_texts(rows), preset["vocab_size"], out_dir, args.init_from)
     preset["vocab_size"] = tok.vocab_size
     cfg = GPTConfig(**preset)
 
+    n_rows = len(rows)
     train_rows, val_rows = train_val_split(rows, args.val_ratio, args.seed)
-    train_ds = ChatDataset(train_rows, tok, cfg.block_size, mask_prompt=not args.train_on_prompt)
+    del rows
     val_ds = ChatDataset(val_rows, tok, cfg.block_size, mask_prompt=not args.train_on_prompt) if val_rows else None
+    del val_rows
+    train_ds = ChatDataset(train_rows, tok, cfg.block_size, mask_prompt=not args.train_on_prompt)
+    # The text is fully tokenised into compact tensors now; free the strings.
+    del train_rows
     if train_ds.n_truncated:
         print(f"warning: {train_ds.n_truncated} example(s) exceeded block_size={cfg.block_size} and were truncated")
     print(f"train {len(train_ds)} / val {len(val_ds) if val_ds else 0} examples, {train_ds.n_tokens} train tokens")
@@ -379,16 +389,19 @@ def run_sft(args) -> None:
         num_workers=args.num_workers, early_stop_patience=args.patience,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
         amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
+        grad_checkpoint=args.grad_checkpoint,
     )
-    meta = {"task": "sft", "dataset": str(args.data), "rows": len(rows), "size": args.size}
+    meta = {"task": "sft", "dataset": str(args.data), "rows": n_rows, "size": args.size}
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, meta)
 
 
 def run_pretrain(args) -> None:
     """`minigpt pretrain` - optional next-token pretraining on a raw text file."""
     out_dir = Path(args.out)
-    text = Path(args.text).read_text(encoding="utf-8")
-    print(f"loaded {len(text)} characters from {args.text}")
+    text_path = Path(args.text)
+    if not text_path.exists():
+        raise SystemExit(f"corpus not found: {text_path}")
+    print(f"streaming {text_path.stat().st_size/1e6:.1f} MB from {text_path}")
 
     preset = dict(PRESETS[args.size])
     for key in ("n_layer", "n_head", "n_embd", "block_size", "vocab_size", "dropout", "n_kv_head"):
@@ -398,16 +411,20 @@ def run_pretrain(args) -> None:
     if getattr(args, "rope_contiguous", False):
         preset["rope_interleaved"] = False
 
-    tok = build_tokenizer([text], preset["vocab_size"], out_dir, args.init_from)
+    # The corpus is never held in memory: the tokenizer counts pieces chunk by
+    # chunk, and the ids are streamed to a compact on-disk file that is memmapped.
+    tok = build_tokenizer(iter_text_chunks(text_path), preset["vocab_size"], out_dir, args.init_from)
     preset["vocab_size"] = tok.vocab_size
     cfg = GPTConfig(**preset)
 
-    ids = [tok.bos_id] + tok.encode(text)
+    print("encoding corpus ...", flush=True)
+    ids = encode_corpus_to_file(iter_text_chunks(text_path), tok, out_dir / "tokens.bin")
+    tok._cache.clear()
     print(f"corpus = {len(ids)} tokens")
     n_val = int(len(ids) * args.val_ratio)
-    train_ids, val_ids = (ids[:-n_val], ids[-n_val:]) if n_val > cfg.block_size else (ids, [])
+    train_ids, val_ids = (ids[:-n_val], ids[-n_val:]) if n_val > cfg.block_size else (ids, None)
     train_ds = PackedTextDataset(train_ids, cfg.block_size, args.stride)
-    val_ds = PackedTextDataset(val_ids, cfg.block_size) if val_ids else None
+    val_ds = PackedTextDataset(val_ids, cfg.block_size) if val_ids is not None else None
 
     model = GPT(cfg)
     tcfg = TrainConfig(
@@ -416,5 +433,6 @@ def run_pretrain(args) -> None:
         seed=args.seed, device=args.device, num_workers=args.num_workers,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
         amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
+        grad_checkpoint=args.grad_checkpoint,
     )
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, {"task": "pretrain", "corpus": str(args.text)})

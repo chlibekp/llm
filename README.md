@@ -355,6 +355,7 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 | `--no-dynamic-padding` | off | Pad every batch to `--block-size` instead |
 | `--num-workers` | `0` | DataLoader worker processes |
 | `--compile` | off | `torch.compile` the model (CUDA/MPS) |
+| `--grad-checkpoint` | off | Recompute activations in backward: much less memory, ~30% slower |
 | `--rope-contiguous` | off | Faster RoPE layout; **breaks older checkpoints** |
 | `--save` | `last` | `last` or `best` |
 | `--patience` | `0` | Early-stop after N epochs without improvement (0 = off) |
@@ -371,6 +372,37 @@ minigpt pretrain --text corpus.txt --out runs/base --size small --epochs 5
 
 Same optimization flags, plus `--stride` to control window overlap when packing the corpus
 into training blocks.
+
+The corpus is never loaded into RAM: it is read in ~1 MB line-aligned chunks, token ids are
+streamed to `<out>/tokens.bin` (uint16 when the vocab fits) and memory-mapped, so a
+multi-hundred-MB text file costs almost nothing beyond the model itself.
+
+**Fastest way to pretrain on a large corpus (Apple Silicon):**
+
+```bash
+minigpt pretrain --text data/train.txt --out runs/base \
+  --size small --dropout 0 --rope-contiguous \
+  --batch-size 64 --epochs 1 --log-every 100 --val-ratio 0.01
+```
+
+- Leave `--device auto` / `--amp auto`: they pick `mps` and bf16.
+- `--dropout 0`: one epoch over a big corpus will not overfit; dropout only costs time.
+- `--rope-contiguous`: faster RoPE kernel. A later `train --init-from runs/base` must pass it too.
+- Do **not** use `--grad-checkpoint` unless you run out of memory; it trades ~30% speed for memory.
+- Raise `--batch-size` (64 → 128) until memory is nearly full, scaling `--lr` with it.
+- `--val-ratio 0.01` keeps evaluation short while still validating on plenty of text.
+- `--compile` can help on MPS but is not guaranteed; time ~100 steps with and without.
+- `--size tiny` is ~3× faster per token than `small`, at the cost of a weaker model.
+
+The pure-Python tokenizer is the bottleneck before training starts. Train it once on a
+sample and reuse it (for `pretrain`, `--init-from` only reuses the tokenizer):
+
+```bash
+head -c 20000000 data/train.txt > /tmp/sample.txt
+minigpt pretrain --text /tmp/sample.txt --out runs/tok --vocab-size 4096 \
+  --n-layer 1 --epochs 1 --batch-size 64  # quick run, only the tokenizer matters
+minigpt pretrain --text data/train.txt --out runs/base --init-from runs/tok ...
+```
 
 ### `minigpt chat` — interactive REPL
 
