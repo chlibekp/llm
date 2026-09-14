@@ -213,7 +213,7 @@ def create_app(model_path: str, model_name: str = "minigpt", device: str = "auto
     def chat_completions(req: ChatRequest):
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
-        prompt = render_prompt([m.model_dump() for m in req.messages])  # type: ignore[arg-type]
+        prompt = render_prompt([m.model_dump() for m in req.messages], tokenizer=served.tokenizer)  # type: ignore[arg-type]
         params = served.params(req, default_max=256)
         stops = _stop_strings(req.stop)
         cid = f"chatcmpl-{uuid.uuid4().hex}"

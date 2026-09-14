@@ -15,6 +15,10 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "pydantic>=2.5",
     "tqdm>=4.66",
+    # pretrained models + LoRA (`minigpt lora`); no transformers needed
+    "safetensors>=0.4",
+    "tokenizers>=0.19",
+    "huggingface_hub>=0.23",
 ]
 
 [project.optional-dependencies]

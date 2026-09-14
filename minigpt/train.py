@@ -70,6 +70,10 @@ class TrainConfig:
     device: str = "auto"
     compile: bool = False
     grad_checkpoint: bool = False  # recompute block activations in backward: less memory, ~30% slower
+    # Big models on MPS: wait for the device after every micro-batch and return cached
+    # blocks after every step. MPS executes asynchronously, so without the wait the
+    # CPU queues micro-batch after micro-batch and their memory piles up.
+    release_cache: bool = False
     amp: str = "auto"            # "auto" | "bf16" | "fp16" | "off"
     dynamic_padding: bool = True  # pad each batch to its own longest example
     pad_multiple: int = 8         # round that length up, to keep matmul shapes few
@@ -196,6 +200,7 @@ def evaluate(
     device: torch.device,
     max_batches: int = 50,
     amp_dtype: torch.dtype | None = None,
+    sync: bool = False,
 ) -> float:
     model.eval()
     total = torch.zeros((), device=device)
@@ -208,6 +213,8 @@ def evaluate(
             _, loss, _ = model(x, targets=y, loss_only=keep is not None, keep_index=keep)
         total += loss.detach().float()
         n += 1
+        if sync and device.type == "mps":
+            torch.mps.synchronize()  # see TrainConfig.release_cache
     model.train()
     return float(total) / max(1, n)
 
@@ -292,6 +299,8 @@ def train_model(
             scaler.scale(loss / cfg.grad_accum).backward()
             running += loss.detach().float()
             seen += 1
+            if cfg.release_cache and device.type == "mps":
+                torch.mps.synchronize()
 
             is_last = micro == n_micro - 1
             if (micro + 1) % cfg.grad_accum != 0 and not is_last:
@@ -308,6 +317,11 @@ def train_model(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if cfg.release_cache and device.type == "mps":
+                # Dynamic padding gives every batch a new shape, and the MPS allocator
+                # keeps cached blocks for each. On SmolLM2-360M that cache held ~1 GB
+                # between steps; releasing it cost no measurable time.
+                torch.mps.empty_cache()
             step += 1
 
             if cfg.log_every and step % cfg.log_every == 0:
@@ -322,7 +336,7 @@ def train_model(
                 seen = 0
 
             if cfg.eval_every and step % cfg.eval_every == 0 and val_loader is not None:
-                val = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
+                val = evaluate(model, val_loader, device, amp_dtype=amp_dtype, sync=cfg.release_cache)
                 history.append({"step": step, "val_loss": val})
                 print(f"  val loss {val:.4f} (ppl {math.exp(min(20, val)):.2f})", flush=True)
                 if val < best_val:
@@ -336,7 +350,7 @@ def train_model(
                 break
 
         if val_loader is not None and not cfg.eval_every:
-            val = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
+            val = evaluate(model, val_loader, device, amp_dtype=amp_dtype, sync=cfg.release_cache)
             history.append({"epoch": epoch + 1, "step": step, "val_loss": val})
             print(
                 f"epoch {epoch+1}/{n_epochs} done | val loss {val:.4f} "
@@ -545,6 +559,51 @@ def run_sft(args) -> None:
         grad_checkpoint=args.grad_checkpoint, optimizer=args.optimizer,
     )
     meta = {"task": "sft","dataset": str(args.data), "rows": n_rows, "size": args.size}
+    train_model(model, tok, train_ds, val_ds, tcfg, out_dir, meta)
+
+
+def run_lora(args) -> None:
+    """`minigpt lora` - LoRA fine-tuning of a pretrained model on a Q&A CSV."""
+    from .hf import default_dtype, load_pretrained
+    from .lora import ALL_TARGETS, ATTN_TARGETS, apply_lora
+
+    if args.optimizer != "adamw":
+        raise SystemExit("--optimizer muon is for full training; LoRA adapters use AdamW")
+    if args.init_from:
+        raise SystemExit("--init-from does not apply to lora; choose the starting model with --base")
+    out_dir = Path(args.out)
+    rows = load_csv(args.data, args.input_col, args.output_col, args.system_col, args.delimiter)
+    print(f"loaded {len(rows)} rows from {args.data}")
+
+    device = resolve_device(args.device)
+    dtype = default_dtype(device) if args.base_dtype == "auto" else getattr(torch, args.base_dtype)
+    model, tok, ref = load_pretrained(args.base, dtype)
+    targets = ALL_TARGETS if args.targets == "all" else ATTN_TARGETS
+    n_train = apply_lora(model, args.rank, args.alpha, args.lora_dropout, targets)
+    print(f"base {ref['name']} ({model.num_parameters()/1e6:.0f}M params, {str(dtype).removeprefix('torch.')}, "
+          f"frozen); training {n_train/1e6:.2f}M LoRA params (rank {args.rank}, {args.targets})")
+
+    n_rows = len(rows)
+    train_rows, val_rows = train_val_split(rows, args.val_ratio, args.seed)
+    del rows
+    mask = not args.train_on_prompt
+    val_ds = ChatDataset(val_rows, tok, args.block_size, mask_prompt=mask) if val_rows else None
+    train_ds = ChatDataset(train_rows, tok, args.block_size, mask_prompt=mask)
+    del train_rows, val_rows
+    if train_ds.n_truncated:
+        print(f"warning: {train_ds.n_truncated} example(s) exceeded --block-size={args.block_size} and were truncated")
+    print(f"train {len(train_ds)} / val {len(val_ds) if val_ds else 0} examples, {train_ds.n_tokens} train tokens")
+
+    tcfg = TrainConfig(
+        epochs=args.epochs, max_steps=args.max_steps, max_tokens=args.max_tokens,
+        batch_size=args.batch_size, grad_accum=args.grad_accum,
+        lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
+        val_ratio=args.val_ratio, seed=args.seed, device=args.device,
+        num_workers=args.num_workers, log_every=args.log_every, eval_every=args.eval_every,
+        save=args.save, amp="off", dynamic_padding=not args.no_dynamic_padding,
+        compile=args.compile, grad_checkpoint=args.grad_checkpoint, release_cache=True,
+    )
+    meta = {"task": "lora", "dataset": str(args.data), "rows": n_rows, "base": ref["name"]}
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, meta)
 
 

@@ -29,6 +29,8 @@ class GPTConfig:
     qk_norm: bool = False        # RMSNorm queries and keys per head: stable at higher LR
     logit_softcap: float = 0.0   # cap * tanh(logits / cap); 0 disables
     zero_init_proj: bool = False # start residual output projections at zero
+    intermediate_size: int | None = None  # exact SwiGLU width; None => from mlp_ratio
+    norm_eps: float = 1e-5       # RMSNorm epsilon (pretrained weights expect their own)
 
     def __post_init__(self) -> None:
         if self.n_kv_head is None:

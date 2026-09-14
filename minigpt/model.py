@@ -124,8 +124,8 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(cfg.dropout)
         # QK-norm bounds the attention logits, so a spike in one projection cannot
         # saturate the softmax. Lets small models train at a higher learning rate.
-        self.q_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
-        self.k_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
+        self.q_norm = RMSNorm(self.head_dim, cfg.norm_eps) if cfg.qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim, cfg.norm_eps) if cfg.qk_norm else None
 
     def forward(
         self,
@@ -189,8 +189,10 @@ class CausalSelfAttention(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        hidden = int(cfg.mlp_ratio * cfg.n_embd)
-        hidden = 32 * ((hidden + 31) // 32)  # round up: nicer for GPU/MPS matmuls
+        hidden = cfg.intermediate_size
+        if hidden is None:
+            hidden = int(cfg.mlp_ratio * cfg.n_embd)
+            hidden = 32 * ((hidden + 31) // 32)  # round up: nicer for GPU/MPS matmuls
         self.gate_proj = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
         self.up_proj = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
         self.down_proj = nn.Linear(hidden, cfg.n_embd, bias=cfg.bias)
@@ -203,9 +205,9 @@ class SwiGLU(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.attn_norm = RMSNorm(cfg.n_embd)
+        self.attn_norm = RMSNorm(cfg.n_embd, cfg.norm_eps)
         self.attn = CausalSelfAttention(cfg)
-        self.mlp_norm = RMSNorm(cfg.n_embd)
+        self.mlp_norm = RMSNorm(cfg.n_embd, cfg.norm_eps)
         self.mlp = SwiGLU(cfg)
 
     def forward(self, x, cos, sin, kv_cache=None):
@@ -222,7 +224,7 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
-        self.norm = RMSNorm(cfg.n_embd)
+        self.norm = RMSNorm(cfg.n_embd, cfg.norm_eps)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.lm_head.weight = self.tok_emb.weight
@@ -352,14 +354,16 @@ class GPT(nn.Module):
                 if keep_index.numel() == 0:
                     # Keep the graph connected so backward still contributes zero.
                     return None, (flat_x.sum() * 0.0).to(torch.float32), None
+            # .float(): with half-precision weights (a frozen pretrained base) the
+            # log-softmax over the vocabulary must still run in float32.
             loss = F.cross_entropy(
-                self._head(flat_x.index_select(0, keep_index)),
+                self._head(flat_x.index_select(0, keep_index)).float(),
                 flat_t.index_select(0, keep_index),
             )
         elif targets is not None:
             logits = self._head(x)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100
+                logits.view(-1, logits.size(-1)).float(), targets.reshape(-1), ignore_index=-100
             )
         else:
             # Inference: only the last position is needed for the next token.

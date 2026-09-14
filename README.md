@@ -8,6 +8,11 @@ Everything is written to run on a **MacBook Air M2**: no GPU cluster, no downloa
 pretrained weights. Training the bundled demo takes about **2.5 minutes** on an M2 and
 about 420 MB of memory.
 
+When a from-scratch model is too small to make sense of your data, there is a second path.
+`minigpt lora` loads a small **pretrained** model (SmolLM2-360M-Instruct by default) into
+the same transformer code and fine-tunes it with LoRA adapters. See
+[Fine-tuning a pretrained model (LoRA)](#fine-tuning-a-pretrained-model-lora).
+
 ```
 $ minigpt train --data data/sample_qa.csv --out runs/demo
 $ minigpt chat --model runs/demo
@@ -25,6 +30,7 @@ bot> Attention lets each token look at other tokens and mix in the information
 - [Install](#install)
 - [Quickstart](#quickstart)
 - [Your data: the CSV format](#your-data-the-csv-format)
+- [Fine-tuning a pretrained model (LoRA)](#fine-tuning-a-pretrained-model-lora)
 - [How it works](#how-it-works)
   - [1. Tokenizer](#1-tokenizer-byte-level-bpe-trained-on-your-data)
   - [2. Prompt format](#2-prompt-format)
@@ -56,11 +62,16 @@ Every piece of the pipeline is implemented in this repo, in readable Python:
 | Model | `minigpt/model.py` | Decoder-only transformer: RoPE, RMSNorm, grouped-query attention, SwiGLU, weight tying |
 | Training | `minigpt/train.py` | AdamW, cosine LR schedule with warmup, gradient accumulation and clipping, checkpointing |
 | Generation | `minigpt/generate.py` | KV-cached sampling with temperature / top-k / top-p / repetition penalty |
-| CLI | `minigpt/cli.py` | `train`, `pretrain`, `chat`, `generate`, `serve`, `info`, `tokenize` |
+| Pretrained models | `minigpt/hf.py` | Loads Llama-architecture Hugging Face weights (e.g. SmolLM2) into the same model code |
+| LoRA | `minigpt/lora.py` | Low-rank adapters on a frozen base, saved as a small `adapter.pt` |
+| CLI | `minigpt/cli.py` | `train`, `pretrain`, `lora`, `chat`, `generate`, `serve`, `info`, `tokenize` |
 | API | `minigpt/server.py` | FastAPI server speaking the OpenAI REST dialect, including SSE streaming |
 
 The only heavy dependency is PyTorch (used for tensors, autograd and the fused attention
-kernel). There is no HuggingFace, no `tokenizers`, no pretrained anything.
+kernel). The from-scratch path uses no pretrained weights and no Hugging Face code. The
+LoRA path adds three small libraries: `huggingface_hub` for the download, `safetensors`
+for the weights and `tokenizers` for the pretrained tokenizer. `transformers` is not
+used. The model itself still runs on `minigpt/model.py`.
 
 ---
 
@@ -161,6 +172,86 @@ Other details:
 - A UTF-8 BOM is handled.
 - Quoted fields may contain newlines and commas (standard CSV rules).
 - Pairs longer than the context window are truncated, with a warning telling you how many.
+
+---
+
+## Fine-tuning a pretrained model (LoRA)
+
+A model trained from zero on a laptop has never read enough text to understand language,
+so it mostly repeats what it memorized. A pretrained model already writes fluent,
+sensible English. LoRA teaches it your data's answers without retraining its weights.
+
+```bash
+# see what the base model says before any fine-tuning
+minigpt chat --model HuggingFaceTB/SmolLM2-360M-Instruct
+
+# fine-tune it on your CSV (the ~700 MB base is downloaded once and cached)
+minigpt lora --data data/qa.csv --out runs/lora
+
+# use the result exactly like any other checkpoint
+minigpt chat --model runs/lora --temperature 0.3
+minigpt serve --model runs/lora
+```
+
+**How it works.**
+
+- `minigpt/hf.py` downloads only `config.json`, the tokenizer files and
+  `model.safetensors`, then renames the weights onto `minigpt/model.py`. SmolLM2 is a
+  Llama-architecture model: RMSNorm, RoPE, GQA, SwiGLU and tied embeddings, the same
+  design minigpt implements. No second model implementation is involved.
+  `tests/test_lora.py` checks the logits against an independent Llama reference
+  implementation.
+- `minigpt/lora.py` freezes the base and wraps every attention and MLP projection:
+  `W x + (alpha/r) · B A x`, with `B` starting at zero so step 0 *is* the pretrained model.
+  At rank 16 that trains **8.7M parameters while 362M stay frozen**. The frozen weights
+  stay in bfloat16 and need no gradients or AdamW state, so optimizer memory drops
+  from ~2.9 GB to ~70 MB.
+- Prompts use the base model's own ChatML template (`<|im_start|>user … <|im_end|>`),
+  including its default system prompt, so the fine-tune starts from the format the model
+  was instruction-tuned on. The loss covers only the answer tokens, as with `train`.
+- The checkpoint holds only `adapter.pt` (~35 MB), the tokenizer, and a reference to the
+  base model pinned to its exact commit. Loading it reloads the cached base, applies the
+  adapters and **merges** them into the weights, so generation runs at base-model speed.
+
+**Memory and speed on an 8 GB M2.** Defaults are `--batch-size 4 --grad-accum 8`
+(effective batch 32), `--lr 2e-4`, `--rank 16`, with activation checkpointing on.
+Measured on an 8 GB M2 with SmolLM2-360M on a 2,000-row sample of `data/qa.csv`
+(~100 tokens per example):
+
+| | |
+|---|---|
+| Peak GPU memory, whole run including validation | **~2.5 GB** |
+| Time per optimizer step (32 examples) | ~11 s (~8 s with `--no-grad-checkpoint`, ~2× the activation memory) |
+| One epoch of the full 85k-row `data/qa.csv` | **~7–8 hours** |
+| Adapter checkpoint | 35 MB |
+
+Two things keep that memory flat. MPS runs asynchronously, so `lora` waits for the device
+after every micro-batch; otherwise queued batches pile up (the first measurement without
+this peaked at 5.6 GB). It also returns the allocator's cached blocks after every step.
+Neither costs measurable time at this model size.
+
+To fit a time budget, cap the run: `--max-tokens 3000000` is about 30k examples, or
+~3 h. Or train on fewer rows, or pick a smaller base with
+`--base HuggingFaceTB/SmolLM2-135M-Instruct` (~3× less compute per token).
+`--eval-every 200` shows validation progress on long runs, and `--save best` (the default
+here) keeps the best adapter.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--base` | `HuggingFaceTB/SmolLM2-360M-Instruct` | Hub id or local directory of a Llama-architecture model |
+| `--rank` / `--alpha` | `16` / `32` | Adapter rank and scale (update is `alpha/rank · BA`) |
+| `--targets` | `all` | `all` projections, or `attn` only (q/k/v/o: fewer params, less memory) |
+| `--lora-dropout` | `0.0` | Dropout on the adapter input |
+| `--block-size` | `512` | Truncate training examples to this many tokens |
+| `--base-dtype` | `auto` | Frozen-weight precision (`auto`: bfloat16 on MPS/CUDA, float32 on CPU) |
+| `--epochs` | `1` | Passes over the CSV; `--max-steps` / `--max-tokens` cut it short |
+| `--val-ratio` / `--save` | `0.02` / `best` | Held-out rows, and keep the lowest-validation-loss adapter |
+
+All the usual optimization flags from `train` apply too (`--grad-checkpoint`,
+`--eval-every`, `--log-every`, …). `--optimizer muon` is rejected, because LoRA adapters use
+AdamW. Only Llama-architecture models load (SmolLM2 135M/360M/1.7B, and other
+`LlamaForCausalLM` checkpoints without RoPE scaling). Anything else is refused with a
+message, not loaded wrong.
 
 ---
 
@@ -390,6 +481,17 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 | `--device` | `auto` | `auto`, `mps`, `cuda`, `cpu` |
 | `--seed` | `1337` | Reproducibility |
 
+### `minigpt lora` — LoRA fine-tuning of a pretrained model
+
+```bash
+minigpt lora --data data/qa.csv --out runs/lora --base HuggingFaceTB/SmolLM2-360M-Instruct
+```
+
+Flags and memory/speed numbers are in
+[Fine-tuning a pretrained model (LoRA)](#fine-tuning-a-pretrained-model-lora). `chat`,
+`generate`, `serve` and `tokenize` accept the resulting directory, or a Hugging Face model id
+directly, e.g. `--model HuggingFaceTB/SmolLM2-360M-Instruct`.
+
 ### `minigpt pretrain` — next-token pretraining on raw text
 
 ```bash
@@ -602,9 +704,8 @@ minigpt chat --model runs/chat --temperature 0.3 --repetition-penalty 1.15
 
 **Set expectations.** `data/qa.csv` covers 641 different projects. A ~12M-parameter model
 cannot store that many specific facts. The best case after a few hours on an M2 is
-fluent, on-topic answers that are often **factually wrong**. For answers that are also
-correct, fine-tune a small pretrained model instead. That is outside the scope of this
-from-scratch project.
+fluent, on-topic answers that are often **factually wrong**. For answers that make sense
+from the first step, use [the LoRA path](#fine-tuning-a-pretrained-model-lora) instead.
 
 ### General tips
 
@@ -659,6 +760,8 @@ Notes for Apple Silicon specifically:
 - Fused AdamW is used on CUDA and MPS when the installed torch supports it.
 - Fine-tuning on the 85k-row `data/qa.csv` runs ~0.55 s/step at the defaults, and auto
   picks 3 epochs: ~35 min in total.
+- `minigpt lora` on SmolLM2-360M peaks at ~2.5 GB of GPU memory and takes ~11 s per
+  32-example step. Inference on the merged model runs at ~38 tokens/s in bfloat16.
 - If you run out of memory, lower `--batch-size` and raise `--grad-accum` to compensate —
   the effective batch stays the same, and on this hardware so does the speed.
 
@@ -676,6 +779,8 @@ minigpt/
   data.py          CSV loading, datasets, train/val split
   model.py         the transformer: RMSNorm, RoPE, attention, SwiGLU, GPT
   optim.py         Muon (+ AdamW for embeddings and norms)
+  hf.py            load pretrained Llama-style Hugging Face models + their tokenizer
+  lora.py          LoRA adapters: apply, save, merge
   train.py         training loops (SFT and pretraining)
   generate.py      KV-cached sampling
   checkpoint.py    save/load a checkpoint directory, device/dtype resolution
@@ -684,7 +789,7 @@ data/
   sample_qa.csv    102-row demo dataset
   qa.csv           85k-row Q&A set for real fine-tuning
   train.txt        ~206 MB raw-text pretraining corpus (not committed)
-tests/             pytest suite (105 tests)
+tests/             pytest suite (115 tests)
 ```
 
 ---
@@ -703,6 +808,9 @@ The suite runs in a few seconds on CPU and covers, among other things:
 - That the model can overfit a single batch — the clearest signal gradients flow.
 - That prompt tokens really are masked out of the loss.
 - That the LR schedule warms up, decays monotonically, and lands on `min_lr`.
+- That pretrained Llama weights loaded into minigpt reproduce an independent Llama
+  forward pass, and that LoRA starts as the base model, trains only the adapters, and
+  merges back exactly. This runs against a tiny model built offline, with no downloads.
 - Full API surface against `fastapi.TestClient`, including that streaming and
   non-streaming produce the same text, and that a client disconnecting mid-stream does not
   wedge the server.
@@ -724,7 +832,8 @@ calling the API, send fewer messages.
 **MPS out of memory** — lower `--batch-size`, raise `--grad-accum`, or drop to
 `--size tiny`.
 
-**Answers are nonsense** — check that training loss actually fell (`minigpt info --model
+**Answers are nonsense** — if you need sensible answers quickly, use `minigpt lora` on a
+pretrained base. For a from-scratch model, check that training loss actually fell (`minigpt info --model
 runs/demo`). If it is still above ~2, train more epochs or raise `--lr`.
 
 **Good answers only when the prompt is copied from the CSV** — the model memorized a

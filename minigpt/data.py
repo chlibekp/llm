@@ -131,7 +131,7 @@ class ChatDataset(Dataset):
         offsets = array("q", [0])
         prompt_lens = array("i")
         for user, assistant, system in rows:
-            prompt, completion = render_example(user, assistant, system)
+            prompt, completion = render_example(user, assistant, system, tokenizer)
             p_ids = tokenizer.encode(prompt)
             c_ids = tokenizer.encode(completion)
             n = len(p_ids) + len(c_ids)

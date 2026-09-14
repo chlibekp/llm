@@ -2,6 +2,7 @@
 
     minigpt train     --data data/sample_qa.csv --out runs/demo
     minigpt pretrain  --text corpus.txt         --out runs/base
+    minigpt lora      --data data/qa.csv        --out runs/lora
     minigpt chat      --model runs/demo
     minigpt generate  --model runs/demo --prompt "What is minigpt?"
     minigpt serve     --model runs/demo --port 8000
@@ -104,6 +105,35 @@ def build_parser() -> argparse.ArgumentParser:
     _add_optim_args(t, epochs=None,
                     epochs_help="passes over the data; None = auto (~3000 steps, at most 30 epochs)")
 
+    # lora -------------------------------------------------------------------
+    lo = sub.add_parser("lora", help="LoRA fine-tuning of a pretrained model on a Q&A CSV",
+                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    lo.add_argument("--data", required=True, help="path to the CSV file")
+    lo.add_argument("--out", default="runs/lora", help="checkpoint directory to write")
+    lo.add_argument("--base", default="HuggingFaceTB/SmolLM2-360M-Instruct",
+                    help="Hugging Face hub id or local directory of a Llama-architecture model")
+    lo.add_argument("--base-dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"],
+                    help="precision of the frozen base weights ('auto': bfloat16 on mps/cuda)")
+    lo.add_argument("--rank", type=int, default=16, help="LoRA rank r")
+    lo.add_argument("--alpha", type=float, default=32.0, help="LoRA scale numerator (update is alpha/r * BA)")
+    lo.add_argument("--lora-dropout", type=float, default=0.0, help="dropout on the adapter input")
+    lo.add_argument("--targets", choices=["all", "attn"], default="all",
+                    help="adapt every projection, or only q/k/v/o (fewer params, less memory)")
+    lo.add_argument("--block-size", type=int, default=512, help="truncate training examples to this many tokens")
+    lo.add_argument("--input-col", default=None, help="question column (auto-detected by default)")
+    lo.add_argument("--output-col", default=None, help="answer column (auto-detected by default)")
+    lo.add_argument("--system-col", default=None, help="optional per-row system prompt column")
+    lo.add_argument("--delimiter", default=None, help="CSV delimiter (sniffed by default)")
+    lo.add_argument("--train-on-prompt", action="store_true",
+                    help="also compute loss on the question (default: answer only)")
+    _add_optim_args(lo, epochs=1, epochs_help="passes over the data")
+    # Checkpointing is on by default here: on SmolLM2-360M it cuts peak MPS memory
+    # from ~2.8 GB to ~1.3 GB at 4x128 tokens, for ~30% more time per step.
+    lo.add_argument("--no-grad-checkpoint", dest="grad_checkpoint", action="store_false",
+                    help="keep activations instead of recomputing them: faster, ~2x the memory")
+    lo.set_defaults(lr=2e-4, weight_decay=0.0, batch_size=4, grad_accum=8, val_ratio=0.02,
+                    save="best", grad_checkpoint=True)
+
     # pretrain ---------------------------------------------------------------
     pt = sub.add_parser("pretrain", help="next-token pretraining on a raw .txt corpus",
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -117,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # chat -------------------------------------------------------------------
     c = sub.add_parser("chat", help="interactive REPL", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    c.add_argument("--model", required=True, help="checkpoint directory")
+    c.add_argument("--model", required=True, help="checkpoint directory or Hugging Face model id")
     c.add_argument("--system", default=None, help="system prompt")
     c.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
     c.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
@@ -187,11 +217,11 @@ def cmd_chat(args) -> None:
             continue
 
         msgs = ([] if args.no_history else list(history)) + [{"role": "user", "content": user}]
-        prompt = render_prompt(msgs, system=args.system)
+        prompt = render_prompt(msgs, system=args.system, tokenizer=tok)
         # Drop the oldest turns until the prompt fits the context window.
         while len(tok.encode(prompt)) > model.cfg.block_size - 16 and len(msgs) > 1:
             msgs = msgs[2:]
-            prompt = render_prompt(msgs, system=args.system)
+            prompt = render_prompt(msgs, system=args.system, tokenizer=tok)
 
         print("bot> ", end="", flush=True)
         answer = ""
@@ -218,7 +248,7 @@ def cmd_generate(args) -> None:
         repetition_penalty=args.repetition_penalty, seed=args.seed,
     )
     prompt = prompt_text if args.raw else render_prompt(
-        [{"role": "user", "content": prompt_text}], system=args.system
+        [{"role": "user", "content": prompt_text}], system=args.system, tokenizer=tok
     )
     for piece in stream_text(model, tok, prompt, params, device):
         print(piece, end="", flush=True)
@@ -250,9 +280,9 @@ def cmd_info(args) -> None:
 
 
 def cmd_tokenize(args) -> None:
-    from .tokenizer import BPETokenizer
+    from .checkpoint import load_tokenizer
 
-    tok = BPETokenizer.load(Path(args.model) / "tokenizer.json")
+    tok = load_tokenizer(args.model)
     ids = tok.encode(args.text)
     print(f"vocab_size = {tok.vocab_size}")
     print(f"{len(ids)} tokens: {ids}")
@@ -267,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "pretrain":
         from .train import run_pretrain
         run_pretrain(args)
+    elif args.command == "lora":
+        from .train import run_lora
+        run_lora(args)
     elif args.command == "chat":
         cmd_chat(args)
     elif args.command == "generate":
