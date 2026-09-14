@@ -11,13 +11,15 @@ Everything here is tuned for a single small device (Apple Silicon / CPU):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -28,10 +30,13 @@ from .data import (
     ChatDataset,
     LengthGroupedSampler,
     PackedTextDataset,
+    default_encode_workers,
     dynamic_collate,
     encode_corpus_to_file,
     iter_text_chunks,
     load_csv,
+    sample_text_chunks,
+    token_dtype,
     train_val_split,
 )
 from .model import GPT
@@ -43,13 +48,20 @@ class TrainConfig:
     """Optimisation hyper-parameters."""
 
     epochs: int = 30
-    batch_size: int = 64         # large enough to amortise the fixed per-step cost
-    grad_accum: int = 1
-    lr: float = 6e-4             # sqrt-scaled for the larger batch
+    max_steps: int = 0           # cap on optimiser steps; 0 = no cap
+    max_tokens: int = 0          # cap on training tokens; 0 = no cap
+    # Effective batch 64. Throughput barely depends on the micro-batch on an M2
+    # (compute-bound: 8.1k vs 8.4k tok/s at 16 vs 32) but activation memory is
+    # proportional to it, so a small micro-batch with accumulation costs ~nothing
+    # in speed and keeps a 64-sequence step from pushing an 8 GB machine into swap.
+    batch_size: int = 16
+    grad_accum: int = 4
+    lr: float = 6e-4             # sqrt-scaled for the effective batch of 64
     min_lr_ratio: float = 0.1
     warmup_ratio: float = 0.05
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
+    optimizer: str = "adamw"      # "adamw" | "muon" (Muon on hidden matrices, AdamW elsewhere)
     grad_clip: float = 1.0
     val_ratio: float = 0.1
     eval_every: int = 0          # in steps; 0 => once per epoch
@@ -92,9 +104,10 @@ def resolve_amp(name: str, device: torch.device) -> torch.dtype | None:
         return torch.float16
     if device.type == "cuda":
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    if device.type == "mps":
-        return torch.bfloat16
-    return None  # CPU autocast is usually slower than plain float32 here
+    # MPS: measured on an M2, `small` at 16x255 tokens, float32 ran 378 ms/step
+    # against 502 ms under bf16 autocast - the per-op casts cost more than the
+    # half-width arithmetic saves. Half precision is still selectable explicitly.
+    return None  # CPU autocast is usually slower than plain float32 too
 
 
 def _build_loader(
@@ -127,6 +140,41 @@ def _build_loader(
     return loader, None
 
 
+def tokens_per_epoch(ds: Dataset) -> int:
+    """Tokens the model is trained on in one pass over ``ds``."""
+    if isinstance(ds, PackedTextDataset):
+        return len(ds) * ds.block_size  # windows overlap when stride < block_size
+    return getattr(ds, "n_tokens", len(ds))
+
+
+def plan_steps(steps_per_epoch: int, epoch_tokens: int, cfg: TrainConfig) -> int:
+    """Total optimiser steps: ``epochs`` passes, cut short by either budget."""
+    total = steps_per_epoch * cfg.epochs
+    if cfg.max_steps > 0:
+        total = min(total, cfg.max_steps)
+    if cfg.max_tokens > 0:
+        tokens_per_step = max(1.0, epoch_tokens / steps_per_epoch)
+        total = min(total, math.ceil(cfg.max_tokens / tokens_per_step))
+    return max(1, total)
+
+
+def auto_epochs(steps_per_epoch: int, target_steps: int = 3000, max_epochs: int = 30) -> int:
+    """Epochs for SFT when ``--epochs`` is not given.
+
+    A small Q&A set needs many passes to be absorbed; a large one reaches the
+    same number of optimiser steps in a few. Aiming for a fixed step count keeps
+    the 100-row demo at 30 epochs while an 80k-row CSV gets 3 instead of 30.
+    """
+    return max(1, min(max_epochs, math.ceil(target_steps / max(1, steps_per_epoch))))
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
 def _to_device(batch, device: torch.device):
     """Unpack a batch from either collate path onto ``device``.
 
@@ -157,7 +205,7 @@ def evaluate(
             break
         x, y, keep = _to_device(batch, device)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            _, loss, _ = model(x, targets=y, loss_only=True, keep_index=keep)
+            _, loss, _ = model(x, targets=y, loss_only=keep is not None, keep_index=keep)
         total += loss.detach().float()
         n += 1
     model.train()
@@ -188,8 +236,9 @@ def train_model(
     )
 
     steps_per_epoch = max(1, math.ceil(len(train_loader) / cfg.grad_accum))
-    total_steps = steps_per_epoch * cfg.epochs
-    optimizer = model.configure_optimizer(cfg.lr, cfg.weight_decay, cfg.betas)
+    total_steps = plan_steps(steps_per_epoch, tokens_per_epoch(train_ds), cfg)
+    n_epochs = math.ceil(total_steps / steps_per_epoch)
+    optimizer = model.configure_optimizer(cfg.lr, cfg.weight_decay, cfg.betas, cfg.optimizer)
 
     amp_dtype = resolve_amp(cfg.amp, device)
     # float16 silently underflows small gradients, so it needs a loss scaler.
@@ -207,8 +256,9 @@ def train_model(
     padding = "dynamic" if train_sampler is not None else "fixed"
     print(
         f"device={device.type} params={raw_model.num_parameters()/1e6:.2f}M "
-        f"examples={len(train_ds)} steps/epoch={steps_per_epoch} total_steps={total_steps} "
-        f"amp={amp_dtype and str(amp_dtype).removeprefix('torch.') or 'off'} padding={padding}"
+        f"examples={len(train_ds)} steps/epoch={steps_per_epoch} epochs={n_epochs} total_steps={total_steps} "
+        f"amp={amp_dtype and str(amp_dtype).removeprefix('torch.') or 'off'} padding={padding} "
+        f"optimizer={cfg.optimizer}"
     )
 
     history: list[dict] = []
@@ -226,7 +276,7 @@ def train_model(
     running = torch.zeros((), device=device)
     seen = 0
 
-    for epoch in range(cfg.epochs):
+    for epoch in range(n_epochs):
         running.zero_()
         seen = 0
         if train_sampler is not None:
@@ -235,7 +285,10 @@ def train_model(
         for micro, batch in enumerate(train_loader):
             x, y, keep = _to_device(batch, device)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                _, loss, _ = model(x, targets=y, loss_only=True, keep_index=keep)
+                # The sparse head needs the loader's index; without one (packed
+                # pretraining, where every position is a target) the dense loss
+                # is the same arithmetic minus a sync, a gather and a scatter.
+                _, loss, _ = model(x, targets=y, loss_only=keep is not None, keep_index=keep)
             scaler.scale(loss / cfg.grad_accum).backward()
             running += loss.detach().float()
             seen += 1
@@ -258,10 +311,11 @@ def train_model(
             step += 1
 
             if cfg.log_every and step % cfg.log_every == 0:
+                elapsed = time.time() - t0
                 print(
-                    f"epoch {epoch+1}/{cfg.epochs} step {step}/{total_steps} "
+                    f"epoch {epoch+1}/{n_epochs} step {step}/{total_steps} "
                     f"loss {float(running)/max(1,seen):.4f} lr {lr:.2e} "
-                    f"{time.time()-t0:.0f}s",
+                    f"{elapsed:.0f}s eta {_fmt_duration(elapsed / step * (total_steps - step))}",
                     flush=True,
                 )
                 running.zero_()
@@ -277,11 +331,15 @@ def train_model(
                         save_checkpoint(out_dir, raw_model, tokenizer,
                                         {**(meta or {}), "val_loss": val, "step": step})
 
+            if step >= total_steps:  # a step or token budget ended training mid-epoch
+                stop = True
+                break
+
         if val_loader is not None and not cfg.eval_every:
             val = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
             history.append({"epoch": epoch + 1, "step": step, "val_loss": val})
             print(
-                f"epoch {epoch+1}/{cfg.epochs} done | val loss {val:.4f} "
+                f"epoch {epoch+1}/{n_epochs} done | val loss {val:.4f} "
                 f"(ppl {math.exp(min(20, val)):.2f})",
                 flush=True,
             )
@@ -332,6 +390,90 @@ def build_tokenizer(
     return tok
 
 
+def _fingerprint(path: Path) -> dict:
+    """Identity of a source file, cheap enough to check on every run."""
+    st = path.stat()
+    return {"path": str(path.resolve()), "bytes": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _tokenizer_digest(tok: BPETokenizer) -> str:
+    return hashlib.sha256(json.dumps([tok.specials, tok.merges]).encode()).hexdigest()
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def prepare_tokenizer(
+    source: Path,
+    texts: Callable[[], Iterable[str]],
+    vocab_size: int,
+    sample_mb: float,
+    out_dir: Path,
+    reuse: str | None = None,
+) -> BPETokenizer:
+    """Train (or reuse) the tokenizer for ``source``.
+
+    Training is cached in ``out_dir``: when a previous run already trained a
+    tokenizer on the same, unmodified file with the same settings, it is loaded
+    instead of retrained. ``texts`` is only called on a cache miss.
+    """
+    if reuse:
+        return build_tokenizer((), vocab_size, out_dir, reuse)
+    key = {"source": _fingerprint(source), "vocab_size": vocab_size, "sample_mb": sample_mb}
+    tok_path, meta_path = out_dir / "tokenizer.json", out_dir / "tokenizer.cache.json"
+    meta = _read_json(meta_path)
+    if meta and meta.get("key") == key and tok_path.exists():
+        tok = BPETokenizer.load(tok_path)
+        if _tokenizer_digest(tok) == meta.get("digest"):
+            print(f"reusing tokenizer from {tok_path} ({source} is unchanged)")
+            return tok
+
+    tok = build_tokenizer(texts(), vocab_size, out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tok.save(tok_path)
+    meta_path.write_text(json.dumps({"key": key, "digest": _tokenizer_digest(tok)}), encoding="utf-8")
+    return tok
+
+
+def sample_rows(rows: list, max_bytes: int) -> list:
+    """Evenly spaced rows totalling about ``max_bytes`` of text (all if 0)."""
+    if max_bytes <= 0:
+        return rows
+    total = sum(len(u) + len(a) + len(s or "") for u, a, s in rows)
+    return rows[:: max(1, math.ceil(total / max_bytes))]
+
+
+def prepare_tokens(text_path: Path, tok: BPETokenizer, out_dir: Path, workers: int) -> np.memmap:
+    """Encode the corpus to ``out_dir/tokens.bin``, or reuse it if still valid.
+
+    The cache is keyed by the corpus file and the exact merges, so editing the
+    corpus or changing the tokenizer re-encodes, and nothing else does.
+    """
+    bin_path, meta_path = out_dir / "tokens.bin", out_dir / "tokens.json"
+    key = {"source": _fingerprint(text_path), "tokenizer": _tokenizer_digest(tok)}
+    dtype = token_dtype(tok.vocab_size)
+    meta = _read_json(meta_path)
+    if (
+        meta and meta.get("key") == key and bin_path.exists()
+        and bin_path.stat().st_size == meta.get("n_tokens", -1) * dtype.itemsize
+    ):
+        print(f"reusing {meta['n_tokens']} encoded tokens from {bin_path}")
+        return np.memmap(bin_path, dtype=dtype, mode="r", shape=(meta["n_tokens"],))
+
+    meta_path.unlink(missing_ok=True)  # never leave a valid-looking key over a partial file
+    print(f"encoding corpus with {workers} worker(s) ...", flush=True)
+    t0 = time.time()
+    ids = encode_corpus_to_file(iter_text_chunks(text_path), tok, bin_path, workers=workers)
+    tok._cache.clear()
+    print(f"  encoded in {time.time() - t0:.0f}s")
+    meta_path.write_text(json.dumps({"key": key, "n_tokens": len(ids)}), encoding="utf-8")
+    return ids
+
+
 def load_pretrained_weights(model: GPT, src: Path) -> None:
     """Warm-start from another checkpoint, skipping tensors whose shape changed.
 
@@ -362,7 +504,11 @@ def run_sft(args) -> None:
     if getattr(args, "rope_contiguous", False):
         preset["rope_interleaved"] = False
 
-    tok = build_tokenizer(iter_texts(rows), preset["vocab_size"], out_dir, args.init_from)
+    sample_bytes = int(args.tokenizer_sample_mb * 1e6)
+    tok = prepare_tokenizer(
+        Path(args.data), lambda: iter_texts(sample_rows(rows, sample_bytes)),
+        preset["vocab_size"], args.tokenizer_sample_mb, out_dir, args.init_from,
+    )
     preset["vocab_size"] = tok.vocab_size
     cfg = GPTConfig(**preset)
 
@@ -382,16 +528,23 @@ def run_sft(args) -> None:
     if args.init_from:
         load_pretrained_weights(model, Path(args.init_from))
 
+    epochs = args.epochs
+    if epochs is None:
+        steps_per_epoch = math.ceil(len(train_ds) / args.batch_size / args.grad_accum)
+        epochs = auto_epochs(steps_per_epoch)
+        print(f"epochs: {epochs} (auto for {steps_per_epoch} steps/epoch; set --epochs to override)")
+
     tcfg = TrainConfig(
-        epochs=args.epochs, batch_size=args.batch_size, grad_accum=args.grad_accum,
+        epochs=epochs, max_steps=args.max_steps, max_tokens=args.max_tokens,
+        batch_size=args.batch_size, grad_accum=args.grad_accum,
         lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
         val_ratio=args.val_ratio, seed=args.seed, device=args.device,
         num_workers=args.num_workers, early_stop_patience=args.patience,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
         amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
-        grad_checkpoint=args.grad_checkpoint,
+        grad_checkpoint=args.grad_checkpoint, optimizer=args.optimizer,
     )
-    meta = {"task": "sft", "dataset": str(args.data), "rows": n_rows, "size": args.size}
+    meta = {"task": "sft","dataset": str(args.data), "rows": n_rows, "size": args.size}
     train_model(model, tok, train_ds, val_ds, tcfg, out_dir, meta)
 
 
@@ -411,15 +564,19 @@ def run_pretrain(args) -> None:
     if getattr(args, "rope_contiguous", False):
         preset["rope_interleaved"] = False
 
-    # The corpus is never held in memory: the tokenizer counts pieces chunk by
-    # chunk, and the ids are streamed to a compact on-disk file that is memmapped.
-    tok = build_tokenizer(iter_text_chunks(text_path), preset["vocab_size"], out_dir, args.init_from)
+    # The corpus is never held in memory: the tokenizer counts pieces from an
+    # evenly spaced sample, and the ids are streamed to a compact on-disk file
+    # that is memmapped. Both are cached in out_dir for the next run.
+    sample_bytes = int(args.tokenizer_sample_mb * 1e6)
+    tok = prepare_tokenizer(
+        text_path, lambda: sample_text_chunks(text_path, sample_bytes),
+        preset["vocab_size"], args.tokenizer_sample_mb, out_dir, args.init_from,
+    )
     preset["vocab_size"] = tok.vocab_size
     cfg = GPTConfig(**preset)
 
-    print("encoding corpus ...", flush=True)
-    ids = encode_corpus_to_file(iter_text_chunks(text_path), tok, out_dir / "tokens.bin")
-    tok._cache.clear()
+    workers = args.encode_workers if args.encode_workers is not None else default_encode_workers()
+    ids = prepare_tokens(text_path, tok, out_dir, workers)
     print(f"corpus = {len(ids)} tokens")
     n_val = int(len(ids) * args.val_ratio)
     train_ids, val_ids = (ids[:-n_val], ids[-n_val:]) if n_val > cfg.block_size else (ids, None)
@@ -428,11 +585,12 @@ def run_pretrain(args) -> None:
 
     model = GPT(cfg)
     tcfg = TrainConfig(
-        epochs=args.epochs, batch_size=args.batch_size, grad_accum=args.grad_accum,
+        epochs=args.epochs, max_steps=args.max_steps, max_tokens=args.max_tokens,
+        batch_size=args.batch_size, grad_accum=args.grad_accum,
         lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
         seed=args.seed, device=args.device, num_workers=args.num_workers,
         log_every=args.log_every, eval_every=args.eval_every, save=args.save,
         amp=args.amp, dynamic_padding=not args.no_dynamic_padding, compile=args.compile,
-        grad_checkpoint=args.grad_checkpoint,
+        grad_checkpoint=args.grad_checkpoint, optimizer=args.optimizer,
     )
-    train_model(model, tok, train_ds, val_ds, tcfg, out_dir, {"task": "pretrain", "corpus": str(args.text)})
+    train_model(model, tok, train_ds, val_ds, tcfg, out_dir, {"task": "pretrain","corpus": str(args.text)})

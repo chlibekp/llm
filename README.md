@@ -229,6 +229,21 @@ A standard decoder-only transformer with the modern refinements, all in `minigpt
 | Feed-forward | **SwiGLU** | Consistently beats a GELU MLP at equal parameter count |
 | Output head | **Tied to the input embedding** | Saves ~1.5M parameters at `d=384, vocab=4096` |
 | Init | N(0, 0.02), residual projections scaled by `1/sqrt(2L)` | Keeps residual-stream variance stable with depth |
+| QK-norm *(`compact`)* | RMSNorm on each head's queries and keys | Bounds attention logits, so training stays stable at higher LR |
+| Logit soft-cap *(`compact`)* | `30 · tanh(logits / 30)` | Stops a small model from pushing a few logits to extremes |
+| Zero-init projections *(`compact`)* | Residual output projections start at 0 | Every block starts as the identity, so early training is faster |
+
+The `compact` preset also changes the shape. It is deep and thin (12 layers × 320 wide,
+8 query heads sharing 2 KV heads) with an 8192-token vocabulary. At this parameter count,
+depth beats width (MobileLLM, 2024). A bigger vocabulary packs more text into each
+256-token window. All three switches are fields in `config.json`. Older checkpoints
+have none of these fields, load with all three off, and behave exactly as before.
+
+**Muon optimizer** (`--optimizer muon`, `minigpt/optim.py`). The 2-D weight matrices inside
+the blocks are updated with Muon: momentum SGD whose update is orthogonalized by five
+Newton–Schulz iterations. The embedding (and so the tied head) and the norm gains stay on
+fused AdamW. Muon updates are rescaled to match AdamW's RMS, so both share `--lr` and
+the schedule. It keeps one state buffer per matrix instead of AdamW's two.
 
 RoPE tables are kept in float32 and cached per device, so casting the model to fp16 never
 blurs the position angles.
@@ -249,20 +264,28 @@ model this small, and a dataset this small, a separate pretraining stage is opti
   in length. Disable with `--no-dynamic-padding`.
 - **Sparse loss head** — during SFT the question and the padding carry the ignore label,
   so only the answer positions are projected through the output head.
-- **Mixed precision** — `--amp` (default `auto`) runs the forward/backward pass in
-  bfloat16 on MPS and CUDA. Normalization and the loss stay in float32.
+- **Precision** — `--amp auto` trains in float32 on MPS and CPU, and in bfloat16 (or
+  float16 with loss scaling) on CUDA. On an M2, bf16 autocast was *slower* than float32
+  (502 vs 378 ms/step), because the per-op casts cost more than the narrower arithmetic
+  saves.
 - **No per-step device sync** — the supervised positions are located on the CPU by the
   data loader and passed in. Finding them on the accelerator would mean `nonzero`, whose
-  output shape depends on the data and so stalls the pipeline once per step.
+  output shape depends on the data and so stalls the pipeline once per step. Packed
+  pretraining supervises every position, so it uses the plain dense loss.
+- **Epochs** — when `--epochs` is not given, `train` picks enough epochs for ~3000
+  optimizer steps, capped at 30: the 100-row demo gets 30, an 80k-row CSV gets 3.
+  `--max-steps` and `--max-tokens` stop a run early, even mid-epoch, with the LR schedule
+  fitted to the shortened run.
 
-At this model size the GPU is **dispatch-bound, not FLOP-bound**: a step issues on the
-order of a thousand kernels, and the fixed part of that (AdamW and gradient clipping have
-no `foreach` path on MPS) does not shrink with the batch. Two consequences shape the
-defaults:
+At this model size an M2 is **compute-bound**: tokens per second barely move with the
+micro-batch (8.1k tok/s at 16 sequences vs 8.4k at 32), while activation memory grows in
+proportion to it (~1.4 GB vs ~3.5 GB of GPU memory). That shapes the defaults:
 
-- `--batch-size` defaults to `64`, not `16`, so that fixed cost is spread over ~4× the
-  tokens. `--lr` is sqrt-scaled to `6e-4` to match. Lower both together if you are memory
-  constrained.
+- `--batch-size 16 --grad-accum 4`: the same effective batch of 64 (and the same
+  `--lr 6e-4`) as one 64-sequence step, at a quarter of the activation memory. A single
+  64-sequence step does not fit comfortably next to macOS on an 8 GB machine, and once it
+  swaps, training slows by orders of magnitude. Want even less memory? `--batch-size 8
+  --grad-accum 8` halves it again for ~10% speed.
 - `RMSNorm` uses the fused `F.rms_norm`, RoPE tables are cached per `(device, dtype)`
   instead of being re-cast on each of the 12 calls per forward, and grouped-query
   attention uses SDPA's own KV broadcast rather than materializing the expanded tensors.
@@ -343,15 +366,18 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 | `--out` | `runs/model` | Checkpoint directory to write |
 | `--input-col` / `--output-col` / `--system-col` | auto | CSV column names |
 | `--delimiter` | sniffed | CSV delimiter |
-| `--size` | `small` | Preset: `tiny`, `small`, `medium`, `large` |
+| `--size` | `small` | Preset: `tiny`, `small`, `medium`, `large`, `compact` |
 | `--n-layer` / `--n-head` / `--n-kv-head` / `--n-embd` / `--block-size` / `--vocab-size` / `--dropout` | preset | Individual overrides |
-| `--epochs` | `30` | Passes over the dataset |
-| `--batch-size` | `64` | Examples per micro-batch |
-| `--grad-accum` | `1` | Micro-batches per optimizer step |
+| `--epochs` | auto | Passes over the dataset (auto: ~3000 steps, at most 30 epochs) |
+| `--max-steps` / `--max-tokens` | `0` | Stop after this many steps / tokens, even mid-epoch (`0` = no cap) |
+| `--batch-size` | `16` | Examples per micro-batch — activation memory scales with this |
+| `--grad-accum` | `4` | Micro-batches per optimizer step (effective batch 64) |
+| `--tokenizer-sample-mb` | `20` | Train the tokenizer on an evenly spaced sample of this many MB (`0` = all) |
 | `--lr` | `6e-4` | Peak learning rate |
+| `--optimizer` | `adamw` | `muon`: Muon on the hidden matrices, AdamW on embeddings and norms |
 | `--weight-decay` / `--warmup-ratio` | `0.1` / `0.05` | Regularization and schedule |
 | `--val-ratio` | `0.1` | Held-out fraction (`0` disables validation) |
-| `--amp` | `auto` | Autocast dtype: `auto`, `bf16`, `fp16`, `off` |
+| `--amp` | `auto` | Autocast dtype: `auto` (float32 on MPS/CPU, bf16 on CUDA), `bf16`, `fp16`, `off` |
 | `--no-dynamic-padding` | off | Pad every batch to `--block-size` instead |
 | `--num-workers` | `0` | DataLoader worker processes |
 | `--compile` | off | `torch.compile` the model (CUDA/MPS) |
@@ -367,42 +393,50 @@ minigpt train --data data/sample_qa.csv --out runs/demo \
 ### `minigpt pretrain` — next-token pretraining on raw text
 
 ```bash
-minigpt pretrain --text corpus.txt --out runs/base --size small --epochs 5
+minigpt pretrain --text corpus.txt --out runs/base --size small
 ```
 
-Same optimization flags, plus `--stride` to control window overlap when packing the corpus
-into training blocks.
+Same optimization flags (default `--epochs 1`), plus `--stride` to control window overlap
+when packing the corpus into training blocks, and `--encode-workers` for the encoder.
 
-The corpus is never loaded into RAM: it is read in ~1 MB line-aligned chunks, token ids are
-streamed to `<out>/tokens.bin` (uint16 when the vocab fits) and memory-mapped, so a
-multi-hundred-MB text file costs almost nothing beyond the model itself.
+The corpus is never loaded into RAM:
+
+- The tokenizer is trained on an evenly spaced ~20 MB sample (`--tokenizer-sample-mb`).
+  A few thousand merges are settled long before hundreds of MB.
+- Token ids are encoded by up to 4 worker processes that import only the tokenizer (no
+  torch). They are handed a few 1 MB chunks at a time, and the ids are streamed to
+  `<out>/tokens.bin` (uint16 when the vocab fits), which is then memory-mapped.
+- Both are **cached** in `<out>`. Rerunning on the same, unmodified corpus with the same
+  settings skips straight to training. Edit the corpus or change the vocabulary and they
+  are rebuilt.
+
+On an M2 (8 GB), with the full 206 MB `data/train.txt`, a first `--size tiny --max-steps
+20` run finished in 17 s end to end: tokenizer training, encoding (6 s) and training. With
+the cache warm, a rerun reached training in ~3 s. The main process stayed under 700 MB RSS.
 
 **Fastest way to pretrain on a large corpus (Apple Silicon):**
 
 ```bash
 minigpt pretrain --text data/train.txt --out runs/base \
-  --size small --dropout 0 --rope-contiguous \
-  --batch-size 64 --epochs 1 --log-every 100 --val-ratio 0.01
+  --size tiny --dropout 0 --rope-contiguous --log-every 100 --val-ratio 0.01
 ```
 
-- Leave `--device auto` / `--amp auto`: they pick `mps` and bf16.
+| `--size` | Params | Speed on M2 | One epoch of `data/train.txt` (~60M tokens) |
+|---|---|---|---|
+| `tiny` | 3.7M | ~0.55 s / step of 64×256 | ~40 min |
+| `small` | 12.2M | ~1.4 s / step of 64×256 | ~80 min |
+
+- Every run prints an `eta`. To fit a time budget, pass `--max-tokens` (or `--max-steps`).
+  The LR schedule is fitted to the shortened run, so stopping early still anneals properly.
+- `tiny` on ~60M tokens is close to the classic ~20-tokens-per-parameter budget. `small`
+  would want several times more data than one epoch provides, so use it when you can
+  afford the time.
 - `--dropout 0`: one epoch over a big corpus will not overfit; dropout only costs time.
-- `--rope-contiguous`: faster RoPE kernel. A later `train --init-from runs/base` must pass it too.
-- Do **not** use `--grad-checkpoint` unless you run out of memory; it trades ~30% speed for memory.
-- Raise `--batch-size` (64 → 128) until memory is nearly full, scaling `--lr` with it.
+- `--rope-contiguous`: faster RoPE kernel. A later `train --init-from runs/base` must pass
+  it too, along with the same `--size`.
+- Do **not** use `--grad-checkpoint` unless you run out of memory; it trades ~30% speed
+  for memory.
 - `--val-ratio 0.01` keeps evaluation short while still validating on plenty of text.
-- `--compile` can help on MPS but is not guaranteed; time ~100 steps with and without.
-- `--size tiny` is ~3× faster per token than `small`, at the cost of a weaker model.
-
-The pure-Python tokenizer is the bottleneck before training starts. Train it once on a
-sample and reuse it (for `pretrain`, `--init-from` only reuses the tokenizer):
-
-```bash
-head -c 20000000 data/train.txt > /tmp/sample.txt
-minigpt pretrain --text /tmp/sample.txt --out runs/tok --vocab-size 4096 \
-  --n-layer 1 --epochs 1 --batch-size 64  # quick run, only the tokenizer matters
-minigpt pretrain --text data/train.txt --out runs/base --init-from runs/tok ...
-```
 
 ### `minigpt chat` — interactive REPL
 
@@ -507,6 +541,7 @@ concurrent clients. Interactive API docs are at `http://localhost:8000/docs`.
 | `small` | 6 | 6 | 384 | 256 | 4096 | 12.2 M | **Default.** Good balance on an M2 Air |
 | `medium` | 8 | 8 | 512 | 512 | 8192 | 29.5 M | Needs a few thousand rows to be worth it |
 | `large` | 12 | 12 | 768 | 512 | 16384 | 97.5 M | Slow on 8 GB; use with a real corpus |
+| `compact` | 12 | 8 (2 KV) | 320 | 256 | 8192 | 15.6 M | Deep and thin, with QK-norm, soft-cap and zero-init; for pretrain → fine-tune |
 
 Rule of thumb: pick the **smallest** preset first. A bigger model on 100 rows does not
 give better answers, it just overfits faster.
@@ -514,6 +549,64 @@ give better answers, it just overfits faster.
 ---
 
 ## Training tips: getting good answers
+
+### Why it only answers questions copied from the CSV
+
+A model trained from random initialization knows no English at all. Train it on a few
+hundred rows and it can only **memorize** them. A question copied from the CSV gets
+the stored answer back. Anything else comes out as noise. The tell is in `minigpt info`:
+validation loss bottoms out after a couple of epochs and then *rises*.
+
+The architecture is not the bottleneck. RoPE, RMSNorm, SwiGLU and GQA are already the
+modern defaults, and a better design buys maybe 1.3–1.5× more out of the same data. More
+tokens buy orders of magnitude. The model has to learn the language first, from raw text,
+and only then learn the Q&A format.
+
+### Recipe: sensible answers on an 8 GB M2
+
+**1. Pretrain on raw text** so the model learns English. `data/train.txt` is ~206 MB
+(~60M tokens):
+
+```bash
+minigpt pretrain --text data/train.txt --out runs/base --size compact --optimizer muon \
+  --batch-size 8 --grad-accum 8 --val-ratio 0.01
+```
+
+`compact` + Muon is the architecture built for this workflow (see
+[Model architecture](#3-model-architecture)). It has not been benchmarked against
+`small` on this corpus yet. `--size small --dropout 0` with the default AdamW is the
+measured fallback, at about 80 min per epoch. `compact` does roughly 1.3× the compute
+per token of `small`.
+
+`--batch-size 8 --grad-accum 8` keeps the effective batch at 64 with about half the
+activation memory of the defaults, for ~10% speed. Pretraining 10 steps on
+`data/sample_train.txt` does nothing useful. You need the full corpus.
+
+**2. Fine-tune on the full Q&A set**, starting from those weights:
+
+```bash
+minigpt train --data data/qa.csv --out runs/chat --init-from runs/base \
+  --size compact --optimizer muon --batch-size 8 --grad-accum 8 --save best
+```
+
+Use the 85k-row `data/qa.csv`, not the 102-row `data/sample_qa.csv`. At this size
+validation loss means something, so `--save best` is the right choice. Pass the same
+`--size` to both stages. Add `--rope-contiguous` only if you pretrained a non-`compact`
+preset with it; `compact` already uses that layout.
+
+**3. Sample conservatively.** A small model drifts fast at high temperature:
+
+```bash
+minigpt chat --model runs/chat --temperature 0.3 --repetition-penalty 1.15
+```
+
+**Set expectations.** `data/qa.csv` covers 641 different projects. A ~12M-parameter model
+cannot store that many specific facts. The best case after a few hours on an M2 is
+fluent, on-topic answers that are often **factually wrong**. For answers that are also
+correct, fine-tune a small pretrained model instead. That is outside the scope of this
+from-scratch project.
+
+### General tips
 
 **Dataset size dominates everything else.**
 
@@ -560,13 +653,14 @@ Measured on an M2 (8 GB), `data/sample_qa.csv` (102 rows), `--size small`, `--bl
 
 Notes for Apple Silicon specifically:
 
-- The backend defaults to **MPS** and the dtype to **float32** — MPS autocast is only
-  reliable in fp16, and at this model size fp32 is fast enough and much more stable.
-  Serve in half precision with `--dtype float16` if you want the smaller footprint.
-- `torch.compile` is applied only on CUDA; it is not yet dependable on MPS.
-- Fused AdamW is CUDA-only and is skipped automatically.
+- The backend defaults to **MPS**, and training and inference both default to
+  **float32**. On an M2, bf16 autocast trained ~25% slower than float32. Serve in half
+  precision with `--dtype float16` if you want the smaller footprint.
+- Fused AdamW is used on CUDA and MPS when the installed torch supports it.
+- Fine-tuning on the 85k-row `data/qa.csv` runs ~0.55 s/step at the defaults, and auto
+  picks 3 epochs: ~35 min in total.
 - If you run out of memory, lower `--batch-size` and raise `--grad-accum` to compensate —
-  the effective batch stays the same.
+  the effective batch stays the same, and on this hardware so does the speed.
 
 ---
 
@@ -581,13 +675,16 @@ minigpt/
   chat.py          prompt template and loss-mask construction
   data.py          CSV loading, datasets, train/val split
   model.py         the transformer: RMSNorm, RoPE, attention, SwiGLU, GPT
+  optim.py         Muon (+ AdamW for embeddings and norms)
   train.py         training loops (SFT and pretraining)
   generate.py      KV-cached sampling
   checkpoint.py    save/load a checkpoint directory, device/dtype resolution
   server.py        FastAPI OpenAI-compatible API
 data/
   sample_qa.csv    102-row demo dataset
-tests/             pytest suite (73 tests)
+  qa.csv           85k-row Q&A set for real fine-tuning
+  train.txt        ~206 MB raw-text pretraining corpus (not committed)
+tests/             pytest suite (105 tests)
 ```
 
 ---
@@ -630,6 +727,11 @@ calling the API, send fewer messages.
 **Answers are nonsense** — check that training loss actually fell (`minigpt info --model
 runs/demo`). If it is still above ~2, train more epochs or raise `--lr`.
 
+**Good answers only when the prompt is copied from the CSV** — the model memorized a
+small dataset and never learned the language. Pretrain on raw text first, then fine-tune
+on more rows. See [Why it only answers questions copied from the
+CSV](#why-it-only-answers-questions-copied-from-the-csv).
+
 **Port already in use** — `minigpt serve --port 8001`.
 
 ---
@@ -641,6 +743,9 @@ implementation of the GPT pipeline, not a competitor to a frontier model.
 
 - It knows nothing that is not in your CSV. It will confidently make things up.
 - With a few hundred rows it largely memorizes rather than generalizes.
+- Without pretraining on raw text it does not know the language at all, only your rows.
+- Even with pretraining, a model this small learns style faster than facts. Expect
+  fluent but often wrong answers on a broad dataset.
 - The default context window is 256 tokens — a few paragraphs.
 - No tool use, no function calling, no retrieval, no safety filtering.
 - The API server has no authentication or rate limiting. Bind it to `127.0.0.1`.

@@ -152,3 +152,33 @@ def test_length_grouped_sampler_batches_are_length_homogeneous():
     spread = [max(lengths[i] for i in b) - min(lengths[i] for i in b) for b in grouped]
     # Random batches of 16 drawn from 1..200 would span most of that range.
     assert sum(spread) / len(spread) < 40
+
+
+def test_sample_text_chunks_is_line_aligned_and_bounded(tmp_path):
+    from minigpt.data import sample_text_chunks
+
+    lines = [f"line {i} café\n" for i in range(20000)]
+    path = tmp_path / "corpus.txt"
+    path.write_text("".join(lines), encoding="utf-8")
+    chunks = list(sample_text_chunks(path, max_bytes=40_000, chunk_bytes=10_000))
+    assert len(chunks) == 4
+    assert sum(len(c.encode()) for c in chunks) <= 40_000
+    known = set(lines)
+    for chunk in chunks:
+        assert chunk.endswith("\n")
+        assert all(line + "\n" in known for line in chunk.splitlines())
+    # A small file is returned whole.
+    assert "".join(sample_text_chunks(path, max_bytes=10**9)) == "".join(lines)
+
+
+def test_parallel_encoding_matches_sequential(tmp_path):
+    from minigpt.data import encode_corpus_to_file, iter_text_chunks
+
+    text = "".join(f"sentence number {i} about the quick brown fox.\n" for i in range(3000))
+    path = tmp_path / "corpus.txt"
+    path.write_text(text, encoding="utf-8")
+    tok = BPETokenizer.train([text], vocab_size=400)
+    seq = encode_corpus_to_file(iter_text_chunks(path, 4096), tok, tmp_path / "a.bin", workers=1)
+    par = encode_corpus_to_file(iter_text_chunks(path, 4096), tok, tmp_path / "b.bin", workers=2)
+    assert seq.tolist() == par.tolist()
+    assert tok.decode(seq.tolist()) == text

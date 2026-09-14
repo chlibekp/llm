@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import csv
 import math
+import multiprocessing as mp
+import os
 import random
 import sys
 from array import array
@@ -27,7 +29,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from .chat import render_example
-from .tokenizer import BPETokenizer
+from .tokenizer import BPETokenizer, encode_chunk_to_bytes, id_typecode, init_encode_worker
 
 INPUT_ALIASES = ["input", "question", "prompt", "instruction", "user", "query", "q"]
 OUTPUT_ALIASES = ["output", "answer", "response", "completion", "assistant", "target", "a"]
@@ -323,25 +325,90 @@ def iter_text_chunks(path: str | Path, chunk_chars: int = 1 << 20) -> Iterator[s
             yield carry
 
 
+def sample_text_chunks(
+    path: str | Path, max_bytes: int, chunk_bytes: int = 1 << 20
+) -> Iterator[str]:
+    """Yield about ``max_bytes`` of ``path``, spread evenly across the file.
+
+    Used to train the tokenizer: BPE merges for a few thousand tokens are settled
+    long before hundreds of MB, and reading evenly spaced windows (rather than
+    the head of the file) keeps the sample representative. Every window is cut
+    on line breaks, so no word and no UTF-8 sequence is split.
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    if max_bytes <= 0 or size <= max_bytes:
+        yield from iter_text_chunks(path, chunk_bytes)
+        return
+    n_windows = max(1, max_bytes // chunk_bytes)
+    with path.open("rb") as fh:
+        for k in range(n_windows):
+            start = k * size // n_windows
+            fh.seek(start)
+            block = fh.read(chunk_bytes)
+            if start > 0:  # drop the partial line we landed in
+                block = block[block.find(b"\n") + 1 :]
+            end = block.rfind(b"\n") + 1
+            if end > 0:
+                yield block[:end].decode("utf-8", errors="replace")
+
+
+def default_encode_workers() -> int:
+    """Encoding processes to use: leave a core for the OS, cap memory use."""
+    return max(1, min(4, (os.cpu_count() or 1) - 1))
+
+
+def _batched(items: Iterable, n: int) -> Iterator[list]:
+    batch: list = []
+    for item in items:
+        batch.append(item)
+        if len(batch) == n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def encode_corpus_to_file(
-    chunks: Iterable[str], tokenizer: BPETokenizer, out_path: str | Path
+    chunks: Iterable[str],
+    tokenizer: BPETokenizer,
+    out_path: str | Path,
+    workers: int = 1,
 ) -> np.memmap:
     """Stream-encode ``chunks`` into a flat binary token file and memory-map it.
 
-    The file starts with ``<|bos|>``. Only one chunk's ids are ever in RAM; the
-    returned memmap is paged in by the OS on demand.
+    The file starts with ``<|bos|>``. With ``workers > 1`` chunks are encoded in
+    parallel by spawned processes that import only the tokenizer (no torch).
+    Chunks are handed out a small window at a time - ``Pool.imap`` would read
+    the entire corpus into its task queue up front - so at most ``2 * workers``
+    chunks are in RAM. The returned memmap is paged in by the OS on demand.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dtype = token_dtype(tokenizer.vocab_size)
+    typecode = id_typecode(tokenizer.vocab_size)
+    assert array(typecode).itemsize == dtype.itemsize
     n = 0
     with out_path.open("wb") as fh:
         fh.write(np.array([tokenizer.bos_id], dtype=dtype).tobytes())
         n += 1
-        for chunk in chunks:
-            ids = np.array(tokenizer.encode(chunk), dtype=dtype)
-            fh.write(ids.tobytes())
-            n += len(ids)
+        if workers <= 1:
+            for chunk in chunks:
+                buf = array(typecode, tokenizer.encode(chunk)).tobytes()
+                fh.write(buf)
+                n += len(buf) // dtype.itemsize
+        else:
+            ctx = mp.get_context("spawn")  # fork is unsafe once torch has loaded
+            with ctx.Pool(
+                workers,
+                initializer=init_encode_worker,
+                initargs=(tokenizer.merges, tokenizer.specials),
+            ) as pool:
+                for window in _batched(chunks, 2 * workers):
+                    jobs = [(chunk, typecode) for chunk in window]
+                    for buf in pool.map(encode_chunk_to_bytes, jobs, chunksize=1):
+                        fh.write(buf)
+                        n += len(buf) // dtype.itemsize
     return np.memmap(out_path, dtype=dtype, mode="r", shape=(n,))
 
 

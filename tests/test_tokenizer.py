@@ -58,3 +58,17 @@ def test_save_load_roundtrip(tok, tmp_path):
 def test_vocab_size_floor():
     with pytest.raises(ValueError):
         BPETokenizer.train(CORPUS, vocab_size=10)
+
+
+def test_merges_follow_count_then_largest_pair():
+    """The heap must pick exactly what a full scan with max((count, pair)) picks."""
+    from collections import Counter
+
+    corpus = ["abab xyxy"] * 5  # (a,b) and (x,y) tie on count; (x,y) is the larger pair
+    tok = BPETokenizer.train(corpus, vocab_size=len(DEFAULT_SPECIALS) + 256 + 1)
+    counts = Counter()
+    for piece in _pieces(corpus[0]):
+        ids = [b + len(DEFAULT_SPECIALS) for b in piece.encode()]
+        counts.update(zip(ids, ids[1:]))
+    best = max(counts, key=lambda p: (counts[p], p))
+    assert tok.merges == [best]

@@ -26,6 +26,9 @@ class GPTConfig:
     rope_interleaved: bool = True  # False = contiguous halves: faster, but a
                                    # different convention, so it breaks old checkpoints
     tie_weights: bool = True     # share input embedding with the output projection
+    qk_norm: bool = False        # RMSNorm queries and keys per head: stable at higher LR
+    logit_softcap: float = 0.0   # cap * tanh(logits / cap); 0 disables
+    zero_init_proj: bool = False # start residual output projections at zero
 
     def __post_init__(self) -> None:
         if self.n_kv_head is None:
@@ -54,4 +57,10 @@ PRESETS: dict[str, dict] = {
     "small":  dict(n_layer=6, n_head=6, n_embd=384, block_size=256, vocab_size=4096),
     "medium": dict(n_layer=8, n_head=8, n_embd=512, block_size=512, vocab_size=8192),
     "large":  dict(n_layer=12, n_head=12, n_embd=768, block_size=512, vocab_size=16384),
+    # Deep and thin (MobileLLM: depth beats width at this scale), with the
+    # small-model stabilisers from the nanoGPT speedrun. New, so it can use the
+    # faster contiguous RoPE layout without breaking any existing checkpoint.
+    "compact": dict(n_layer=12, n_head=8, n_kv_head=2, n_embd=320, block_size=256,
+                    vocab_size=8192, dropout=0.0, rope_interleaved=False,
+                    qk_norm=True, logit_softcap=30.0, zero_init_proj=True),
 }

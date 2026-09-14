@@ -223,3 +223,63 @@ def test_grouped_query_attention_matches_the_materialised_path():
         finally:
             M._HAS_ENABLE_GQA = orig
     assert torch.allclose(fast, materialised, atol=1e-5)
+
+
+def test_qk_norm_and_softcap_keep_cached_decoding_exact():
+    import torch
+
+    m = make_model(qk_norm=True, logit_softcap=5.0, n_kv_head=2)
+    x = torch.randint(0, 128, (1, 12))
+    with torch.no_grad():
+        full, _, _ = m(x, targets=x)
+        caches = m.empty_cache(1, torch.device("cpu"), torch.float32)
+        outs = []
+        for i in range(12):
+            logits, _, caches = m(x[:, i : i + 1], kv_caches=caches, pos_offset=i)
+            outs.append(logits[:, -1])
+    assert torch.allclose(torch.stack(outs, dim=1), full, atol=1e-4)
+
+
+def test_logit_softcap_bounds_logits_and_the_sparse_loss_agrees():
+    import torch
+
+    torch.manual_seed(0)
+    m = make_model(logit_softcap=2.0)
+    with torch.no_grad():
+        for p in m.parameters():
+            p.mul_(20)                       # blow the raw logits far past the cap
+        x = torch.randint(0, 128, (2, 10))
+        y = x.clone()
+        y[:, :4] = -100
+        logits, dense, _ = m(x, targets=y)
+        _, sparse, _ = m(x, targets=y, loss_only=True)
+    assert logits.abs().max() <= 2.0
+    assert torch.allclose(dense, sparse, atol=1e-5)
+
+
+def test_zero_init_proj_makes_every_block_start_as_identity():
+    import torch
+
+    m = make_model(zero_init_proj=True)
+    for block in m.blocks:
+        assert torch.count_nonzero(block.attn.o_proj.weight) == 0
+        assert torch.count_nonzero(block.mlp.down_proj.weight) == 0
+
+
+def test_configs_saved_before_the_new_fields_load_with_them_off():
+    from minigpt.config import GPTConfig
+
+    old = {"vocab_size": 64, "block_size": 16, "n_layer": 1, "n_head": 2, "n_kv_head": 2,
+           "n_embd": 32, "mlp_ratio": 8 / 3, "dropout": 0.0, "bias": False,
+           "rope_theta": 10000.0, "rope_interleaved": True, "tie_weights": True}
+    cfg = GPTConfig.from_dict(old)
+    assert not cfg.qk_norm and cfg.logit_softcap == 0.0 and not cfg.zero_init_proj
+    assert not any("q_norm" in k for k in make_model().state_dict())
+
+
+def test_compact_preset_builds():
+    from minigpt.config import PRESETS, GPTConfig
+    from minigpt.model import GPT
+
+    m = GPT(GPTConfig(**PRESETS["compact"]))
+    assert 14e6 < m.num_parameters() < 17e6

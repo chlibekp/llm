@@ -29,17 +29,27 @@ def _add_model_shape_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--n-embd", type=int, default=None, help="override: embedding width")
     p.add_argument("--block-size", type=int, default=None, help="override: context length in tokens")
     p.add_argument("--vocab-size", type=int, default=None, help="override: target BPE vocabulary size")
+    p.add_argument("--tokenizer-sample-mb", type=float, default=20.0,
+                   help="train the tokenizer on an evenly spaced sample of this many MB (0 = all data)")
     p.add_argument("--dropout", type=float, default=None, help="override: dropout probability")
     p.add_argument("--rope-contiguous", action="store_true",
                    help="faster contiguous-halves RoPE layout; incompatible with "
                         "checkpoints trained without it")
 
 
-def _add_optim_args(p: argparse.ArgumentParser, epochs: int) -> None:
-    p.add_argument("--epochs", type=int, default=epochs)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimiser step")
+def _add_optim_args(p: argparse.ArgumentParser, epochs: int | None, epochs_help: str) -> None:
+    p.add_argument("--epochs", type=int, default=epochs, help=epochs_help)
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="stop after this many optimiser steps, even mid-epoch (0 = no cap)")
+    p.add_argument("--max-tokens", type=int, default=0,
+                   help="stop after training on this many tokens, even mid-epoch (0 = no cap)")
+    p.add_argument("--batch-size", type=int, default=16,
+                   help="examples per micro-batch; activation memory scales with it")
+    p.add_argument("--grad-accum", type=int, default=4,
+                   help="micro-batches per optimiser step (effective batch = batch-size x grad-accum)")
     p.add_argument("--lr", type=float, default=6e-4)
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                   help="'muon': Muon on the hidden matrices, AdamW on embeddings and norms")
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--val-ratio", type=float, default=0.1, help="fraction held out for validation")
@@ -47,7 +57,7 @@ def _add_optim_args(p: argparse.ArgumentParser, epochs: int) -> None:
     p.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "off"],
-                   help="mixed-precision autocast dtype ('auto' picks bf16 on mps/cuda)")
+                   help="mixed-precision autocast dtype ('auto': bf16/fp16 on cuda, float32 on mps and cpu)")
     p.add_argument("--no-dynamic-padding", action="store_true",
                    help="pad every batch to block_size instead of to its longest example")
     p.add_argument("--compile", action="store_true",
@@ -91,7 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also compute loss on the question (default: answer only)")
     t.add_argument("--patience", type=int, default=0, help="early-stop after N epochs without val improvement")
     _add_model_shape_args(t)
-    _add_optim_args(t, epochs=30)
+    _add_optim_args(t, epochs=None,
+                    epochs_help="passes over the data; None = auto (~3000 steps, at most 30 epochs)")
 
     # pretrain ---------------------------------------------------------------
     pt = sub.add_parser("pretrain", help="next-token pretraining on a raw .txt corpus",
@@ -99,8 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--text", required=True, help="path to a UTF-8 text file")
     pt.add_argument("--out", default="runs/base")
     pt.add_argument("--stride", type=int, default=None, help="window stride (default: block_size, no overlap)")
+    pt.add_argument("--encode-workers", type=int, default=None,
+                    help="processes encoding the corpus; None = cores-1, at most 4")
     _add_model_shape_args(pt)
-    _add_optim_args(pt, epochs=5)
+    _add_optim_args(pt, epochs=1, epochs_help="passes over the corpus")
 
     # chat -------------------------------------------------------------------
     c = sub.add_parser("chat", help="interactive REPL", formatter_class=argparse.ArgumentDefaultsHelpFormatter)

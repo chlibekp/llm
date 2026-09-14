@@ -122,6 +122,10 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = nn.Linear(cfg.n_embd, self.n_kv_head * self.head_dim, bias=cfg.bias)
         self.o_proj = nn.Linear(self.n_head * self.head_dim, cfg.n_embd, bias=cfg.bias)
         self.resid_dropout = nn.Dropout(cfg.dropout)
+        # QK-norm bounds the attention logits, so a spike in one projection cannot
+        # saturate the softmax. Lets small models train at a higher learning rate.
+        self.q_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
 
     def forward(
         self,
@@ -135,6 +139,8 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
         q = apply_rope(q, cos, sin, self.rope_interleaved)
         k = apply_rope(k, cos, sin, self.rope_interleaved)
 
@@ -232,9 +238,14 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # Scaled init for the residual output projections (GPT-2 trick): keeps
         # the variance of the residual stream constant as depth grows.
+        # With zero_init_proj every block starts as the identity instead (nanoGPT
+        # speedrun): the residual stream is just the embedding at step 0.
         for name, p in self.named_parameters():
             if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+                if cfg.zero_init_proj:
+                    nn.init.zeros_(p)
+                else:
+                    nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -259,6 +270,18 @@ class GPT(nn.Module):
             cached = (cos, sin)
             self._rope[key] = cached
         return cached
+
+    def _head(self, x: torch.Tensor) -> torch.Tensor:
+        """Project to vocabulary logits, soft-capped when configured.
+
+        The cap keeps a small model from pushing a few logits to extreme values,
+        which otherwise shows up as over-confident, repetitive samples.
+        """
+        logits = self.lm_head(x)
+        cap = self.cfg.logit_softcap
+        if cap > 0:
+            logits = cap * torch.tanh(logits / cap)
+        return logits
 
     def num_parameters(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
@@ -290,7 +313,9 @@ class GPT(nn.Module):
             keep_index: flat indices of the supervised positions. Computing them
                 here means calling ``nonzero``, whose output shape depends on the
                 data and therefore forces a device synchronisation on every step.
-                The data loader already knows them, so it passes them in.
+                The data loader already knows them, so it passes them in. Callers
+                that have no index (pretraining, where every position is
+                supervised) should use the dense loss instead.
 
         Returns:
             ``(logits, loss, new_kv_caches)``.
@@ -328,17 +353,17 @@ class GPT(nn.Module):
                     # Keep the graph connected so backward still contributes zero.
                     return None, (flat_x.sum() * 0.0).to(torch.float32), None
             loss = F.cross_entropy(
-                self.lm_head(flat_x.index_select(0, keep_index)),
+                self._head(flat_x.index_select(0, keep_index)),
                 flat_t.index_select(0, keep_index),
             )
         elif targets is not None:
-            logits = self.lm_head(x)
+            logits = self._head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100
             )
         else:
             # Inference: only the last position is needed for the next token.
-            logits = self.lm_head(x[:, -1:, :])
+            logits = self._head(x[:, -1:, :])
             loss = None
         return logits, loss, (new_caches if kv_caches is not None else None)
 
@@ -351,8 +376,28 @@ class GPT(nn.Module):
             for _ in range(self.cfg.n_layer)
         ]
 
-    def configure_optimizer(self, lr: float, weight_decay: float, betas: tuple[float, float]):
-        """AdamW with weight decay applied only to matrices, not to norms/biases."""
+    def configure_optimizer(
+        self, lr: float, weight_decay: float, betas: tuple[float, float], name: str = "adamw"
+    ):
+        """AdamW with weight decay applied only to matrices, not to norms/biases.
+
+        ``name="muon"`` moves the 2-D weights inside the blocks to Muon; the
+        embedding (also the tied output head) and the norm gains stay on AdamW.
+        """
+        if name == "muon":
+            from .optim import MuonAdamW
+
+            hidden = [p for p in self.blocks.parameters() if p.requires_grad and p.dim() == 2]
+            hidden_ids = {id(p) for p in hidden}
+            rest = [p for p in self.parameters() if p.requires_grad and id(p) not in hidden_ids]
+            groups = [
+                {"params": hidden, "use_muon": True, "weight_decay": weight_decay},
+                {"params": [p for p in rest if p.dim() >= 2], "weight_decay": weight_decay},
+                {"params": [p for p in rest if p.dim() < 2], "weight_decay": 0.0},
+            ]
+            return MuonAdamW([g for g in groups if g["params"]], lr=lr, betas=betas)
+        if name != "adamw":
+            raise ValueError(f"unknown optimizer {name!r}")
         decay, no_decay = [], []
         for p in self.parameters():
             if not p.requires_grad:
@@ -362,5 +407,13 @@ class GPT(nn.Module):
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-        fused = torch.cuda.is_available()
-        return torch.optim.AdamW(groups, lr=lr, betas=betas, fused=fused)
+        # The fused kernel updates every tensor in a handful of dispatches instead
+        # of ~10 per parameter. MPS has one since torch 2.4; older builds reject
+        # fused=True at construction, so fall back rather than fail.
+        device = next(self.parameters()).device
+        if device.type in ("cuda", "mps"):
+            try:
+                return torch.optim.AdamW(groups, lr=lr, betas=betas, fused=True)
+            except (RuntimeError, TypeError):
+                pass
+        return torch.optim.AdamW(groups, lr=lr, betas=betas)

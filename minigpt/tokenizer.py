@@ -13,13 +13,19 @@ The training algorithm is the classic BPE loop (Sennrich et al., 2016):
 
 The naive loop recounts every pair after every merge, which is far too slow in
 pure Python. We keep an incremental index (``pair -> word indices``) so each
-merge only touches the pieces that actually contain the merged pair.
+merge only touches the pieces that actually contain the merged pair, and a heap
+of pair counts so finding the next merge does not scan every pair.
+
+This module deliberately imports nothing heavy (no torch, no numpy): encoding
+worker processes import only this file, which keeps their memory small.
 """
 
 from __future__ import annotations
 
+import heapq
 import json
 import re
+from array import array
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -126,41 +132,65 @@ class BPETokenizer:
 
         pair_counts: dict[tuple[int, int], int] = defaultdict(int)
         pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
-
-        def index_word(i: int, sign: int) -> None:
-            word, f = words[i], freqs[i]
+        for i, word in enumerate(words):
+            f = freqs[i]
             for pair in zip(word, word[1:]):
-                pair_counts[pair] += sign * f
-                if sign > 0:
-                    pair_to_words[pair].add(i)
+                pair_counts[pair] += f
+                pair_to_words[pair].add(i)
+        pair_counts = dict(pair_counts)
 
-        for i in range(len(words)):
-            index_word(i, +1)
+        # Max-heap of counts. Ties go to the larger pair, hence the negated ids.
+        # A heap cannot update entries in place, so entries go stale when a count
+        # changes: a count that grows pushes a fresh entry, and a stale entry is
+        # re-queued at its current count when it reaches the top.
+        heap = [(-c, (-a, -b)) for (a, b), c in pair_counts.items()]
+        heapq.heapify(heap)
 
         merges: list[tuple[int, int]] = []
-        for step in range(n_merges):
-            if not pair_counts:
-                break
-            best = max(pair_counts, key=lambda p: (pair_counts[p], p))
-            if pair_counts[best] < min_frequency:
+        while len(merges) < n_merges and heap:
+            neg_count, (na, nb) = heapq.heappop(heap)
+            best = (-na, -nb)
+            count = pair_counts.get(best, 0)
+            if count != -neg_count:
+                if count > 0:
+                    heapq.heappush(heap, (-count, (na, nb)))
+                continue
+            if count < min_frequency:
                 break
             new_id = offset + 256 + len(merges)
             merges.append(best)
             a, b = best
-            affected = [i for i in pair_to_words.get(best, ()) if _contains(words[i], a, b)]
-            for i in affected:
-                index_word(i, -1)
-                words[i] = _merge_word(words[i], a, b, new_id)
-                index_word(i, +1)
+
+            delta: dict[tuple[int, int], int] = defaultdict(int)
+            for i in pair_to_words.pop(best, ()):
+                word = words[i]
+                if not _contains(word, a, b):
+                    continue
+                f = freqs[i]
+                for pair in zip(word, word[1:]):
+                    delta[pair] -= f
+                word = _merge_word(word, a, b, new_id)
+                words[i] = word
+                for pair in zip(word, word[1:]):
+                    delta[pair] += f
+                    # Only pairs touching the new id are new to this word.
+                    if pair[0] == new_id or pair[1] == new_id:
+                        pair_to_words[pair].add(i)
             pair_counts.pop(best, None)
-            pair_to_words.pop(best, None)
-            # Drop pairs that no longer occur so ``max`` stays cheap.
-            if step % 256 == 0:
-                for p in [p for p, c in pair_counts.items() if c <= 0]:
-                    pair_counts.pop(p, None)
-                    pair_to_words.pop(p, None)
-            if verbose and step % 500 == 0:
-                print(f"  bpe merge {step}/{n_merges}", flush=True)
+
+            for pair, d in delta.items():
+                if d == 0 or pair == best:
+                    continue
+                c = pair_counts.get(pair, 0) + d
+                if c > 0:
+                    pair_counts[pair] = c
+                    if d > 0:
+                        heapq.heappush(heap, (-c, (-pair[0], -pair[1])))
+                else:
+                    pair_counts.pop(pair, None)
+                    pair_to_words.pop(pair, None)
+            if verbose and len(merges) % 500 == 0:
+                print(f"  bpe merge {len(merges)}/{n_merges}", flush=True)
         return cls(merges, specials)
 
     # ----------------------------------------------------------------- encode
@@ -250,6 +280,33 @@ class BPETokenizer:
     def load(cls, path: str | Path) -> "BPETokenizer":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls([tuple(m) for m in data["merges"]], data["specials"])
+
+
+def id_typecode(vocab_size: int) -> str:
+    """``array`` typecode of the smallest unsigned int that holds every id."""
+    if vocab_size <= 2**16:
+        return "H"
+    return "I" if array("I").itemsize == 4 else "L"
+
+
+# One tokenizer per encoding worker process, built once by the initializer.
+_worker_tokenizer: BPETokenizer | None = None
+
+
+def init_encode_worker(merges: Sequence[tuple[int, int]], specials: Sequence[str]) -> None:
+    global _worker_tokenizer
+    _worker_tokenizer = BPETokenizer(merges, specials)
+
+
+def encode_chunk_to_bytes(args: tuple[str, str]) -> bytes:
+    """Worker entry point: encode one text chunk to packed ids.
+
+    Returning packed bytes instead of a list of ints makes the result ~20x
+    cheaper to pickle back to the parent.
+    """
+    text, typecode = args
+    assert _worker_tokenizer is not None, "init_encode_worker was not called"
+    return array(typecode, _worker_tokenizer.encode(text)).tobytes()
 
 
 def _contains(word: list[int], a: int, b: int) -> bool:
